@@ -1,0 +1,22 @@
+{
+  "_comment": "Copy to ~/.claude/sprawl-guard.json (all projects) or <project>/.claude/sprawl-guard.json (one project). Keep only the keys you want to change. Rule modes: deny | confirm | ask | warn | off.",
+  "versioned_files": "deny",
+  "backup_files": "deny",
+  "versioned_no_base": "warn",
+  "similar_files": "deny",
+  "sibling_names": "warn",
+  "report_files": "confirm",
+  "other_docs": "warn",
+  "oneoff_scripts": "deny",
+  "long_names": "deny",
+  "generic_names": "deny",
+  "file_budget": 10,
+  "file_budget_mode": "ask",
+  "similarity_threshold": 0.6,
+  "max_name_length": 30,
+  "max_name_separators": 3,
+  "git_checkpoint": true,
+  "stop_check": "list",
+  "reminder": "compact",
+  "allow_paths": []
+}
