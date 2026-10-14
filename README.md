@@ -63,18 +63,62 @@ and anything allowed in unattended mode. This is shown to you, not added to Clau
 
 ## Install
 
-Requires Python 3.8+ and nothing else. Same steps on Windows and Linux.
+Requires Python 3.8+ and git. No other dependencies. Same steps on Windows, macOS and Linux.
+Install it on every machine where you run Claude Code (laptop, server, ...), because hooks run
+locally on the machine where Claude Code runs.
 
-```bash
-python install.py                          # all your projects
-python install.py --project /path/to/repo  # one project only
-```
+1. Clone it to a permanent location. The hooks point to this folder, so do not leave it in a
+   temporary or downloads folder.
 
-Then **restart Claude Code** (`/exit`, then `claude`) and run `/hooks` to check the four hooks.
+   ```bash
+   git clone https://github.com/nyla111/sprawl-guard.git ~/tools/sprawl-guard
+   cd ~/tools/sprawl-guard
+   ```
+
+   On Windows PowerShell, use for example `git clone https://github.com/nyla111/sprawl-guard.git D:\tools\sprawl-guard`.
+
+2. Optional but recommended: run the tests.
+
+   ```bash
+   python3 -m unittest test_sprawl_guard
+   ```
+
+3. Install the hooks.
+
+   ```bash
+   python3 install.py                          # all your projects
+   python3 install.py --project /path/to/repo  # one project only
+   ```
+
+   Use `python` instead of `python3` on Windows. The installer records the exact Python you ran
+   it with, so run it with the interpreter you want the hooks to use.
+
+4. **Restart Claude Code** (`/exit`, then `claude`) and run `/hooks` to check the four hooks
+   are listed. If the list is empty, you started Claude Code in a different folder than the one
+   you installed into (project installs apply only to that folder).
 
 The installer keeps your existing settings, writes a `.sprawl-guard.bak` backup first, and
-records the absolute path of the Python you ran it with. Re-running it is safe and replaces
-the old entries. The hooks point to this folder: if you move it, run the installer again.
+never touches hooks it did not create. Re-running it is safe and replaces the old entries.
+If you move the folder, run the installer again.
+
+## Update
+
+```bash
+cd ~/tools/sprawl-guard
+git pull
+```
+
+Script changes apply from the next Claude Code session. Run `install.py` again only if a release
+adds or changes hooks (the release notes will say so).
+
+## Repository layout
+
+| File | Purpose |
+|---|---|
+| `sprawl_guard.py` | The guard: one script that handles all four hook events |
+| `install.py` | Adds or removes the hooks in a Claude Code settings file |
+| `sprawl-guard.example.json` | Example config with every option and its default |
+| `test_sprawl_guard.py` | Test suite (feeds the script real hook JSON in temporary folders) |
 
 ## Configure
 
