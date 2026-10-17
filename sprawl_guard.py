@@ -2,10 +2,11 @@
 """sprawl-guard: stop Claude Code from cluttering your workspace.
 
 One script, four hook events (pass the event as the first argument):
-  pre-write      PreToolUse on Write   - judges every NEW file before it is created
-  prompt         UserPromptSubmit      - records the prompt (named files, unattended mode); silent by default
-  session-start  SessionStart          - snapshots the workspace; re-adds the rules after compaction
-  stop           Stop                  - lists files created this turn and anything allowed while unattended
+  pre-write      PreToolUse on Write/Edit - protected paths for every write or edit;
+                 all other rules for every NEW file created with Write
+  prompt         UserPromptSubmit         - records the prompt (named files, unattended mode); silent by default
+  session-start  SessionStart             - snapshots the workspace; re-adds the rules after compaction
+  stop           Stop                     - end-of-turn summary of new files (turn_check)
 
 Rule modes:
   deny     blocked; Claude fixes it itself (merge into the original, rename, use the scratchpad)
@@ -30,9 +31,9 @@ import sys
 import tempfile
 import time
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 TAG = "sprawl-guard"
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,8 @@ DEFAULT_CONFIG = {
     "oneoff_scripts": "deny",     # debug_x.py, tmp_test.py -> session scratchpad
     "long_names": "deny",         # names over max_name_length or max_name_separators
     "generic_names": "deny",      # utils2.py, misc.py, names containing dates
+    "outputs_files": "warn",      # logs, checkpoints, results outside the outputs folder
+    "root_files": "off",          # new code files at the project root when code folders exist
     # --- thresholds ---
     "file_budget": 10,            # new files per session before each further one needs approval (0 = off)
     "file_budget_mode": "ask",
@@ -60,11 +63,28 @@ DEFAULT_CONFIG = {
     "max_name_length": 30,
     "max_name_separators": 3,
     # --- behaviour ---
+    "protected_paths": [],        # never written or edited, e.g. ["data/raw/**", "results/final"]
+    "outputs_dir": "outputs",     # run outputs go to outputs/<run>/; no rules apply inside it
     "git_checkpoint": True,       # local commit of the original before Claude edits it in place (never pushes)
-    "stop_check": "list",         # off | list | force
+    "turn_check": "summary",      # off | summary | list | force
+    "orphan_check": True,         # turn summary counts new code files nothing references
     "reminder": "compact",        # compact (after compaction) | always (every prompt) | off
     # --- word lists ---
     "doc_extensions": [".md", ".markdown", ".txt", ".rst", ".adoc", ".org"],
+    "code_extensions": [
+        ".py", ".ipynb", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".sh", ".r", ".jl",
+        ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".rb", ".php",
+        ".lua", ".scala", ".kt", ".swift",
+    ],
+    "output_extensions": [
+        ".log", ".pt", ".pth", ".ckpt", ".h5", ".hdf5", ".npy", ".npz", ".pkl", ".pickle",
+        ".joblib", ".safetensors", ".onnx",
+    ],
+    "output_data_extensions": [".csv", ".tsv", ".json", ".jsonl", ".txt", ".parquet"],
+    "output_keywords": [
+        "results", "result", "metrics", "scores", "predictions", "preds", "eval",
+        "evaluation", "log", "logs", "output", "outputs", "history", "checkpoint", "ckpt",
+    ],
     "report_keywords": [
         "summary", "report", "notes", "findings", "progress", "status", "recap",
         "changes", "analysis", "overview", "walkthrough", "implementation",
@@ -100,20 +120,24 @@ DEFAULT_CONFIG = {
         "readme", "license", "changelog", "contributing", "code_of_conduct",
         "security", "claude", "agents", "notice", "authors", "requirements",
     ],
+    "root_allowed": ["setup", "conftest", "manage", "noxfile", "main", "app", "__init__", "__main__"],
     "ignore_dirs": [
         ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
         "env", ".mypy_cache", ".pytest_cache", ".tox", "dist", "build",
         ".idea", ".vscode", ".ipynb_checkpoints", ".claude",
+        "wandb", "mlruns", "lightning_logs", "miniconda3", "anaconda3", "miniforge3",
+        "mambaforge", "site-packages",
     ],
     "allow_paths": [],            # globs always allowed, relative with forward slashes, e.g. "docs/**"
 }
 
 SEVERITY = {"off": 0, "warn": 1, "ask": 2, "confirm": 3, "deny": 4}
+WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 
 REMINDER = (
     "Workspace rules: edit existing files instead of creating copies or variants (_v2, per-run scripts); "
     "put run variations in configs or arguments; summaries go in the chat reply; "
-    "throwaway scripts go in the session scratchpad."
+    "throwaway scripts go in the session scratchpad; run outputs go in the outputs folder."
 )
 
 
@@ -123,15 +147,21 @@ def guard_home() -> Path:
 
 def load_config(project_dir: Path) -> dict:
     cfg = dict(DEFAULT_CONFIG)
+    user_keys: set[str] = set()
     for path in (guard_home() / "sprawl-guard.json", project_dir / ".claude" / "sprawl-guard.json"):
         try:
             with open(path, encoding="utf-8") as f:
                 user = json.load(f)
             if isinstance(user, dict):
-                cfg.update({k: v for k, v in user.items() if not k.startswith("_")})
+                clean = {k: v for k, v in user.items() if not k.startswith("_")}
+                cfg.update(clean)
+                user_keys.update(clean)
         except (OSError, ValueError):
             continue
-    if cfg.get("reminder") is True:     # v0.1 config compatibility
+    # compatibility with older config files
+    if "stop_check" in user_keys and "turn_check" not in user_keys:
+        cfg["turn_check"] = cfg["stop_check"]
+    if cfg.get("reminder") is True:
         cfg["reminder"] = "compact"
     elif cfg.get("reminder") is False:
         cfg["reminder"] = "off"
@@ -188,6 +218,14 @@ def rel_of(target: Path, root: Path) -> str:
         return str(target).replace("\\", "/")
 
 
+def skip_dir(name: str, cfg: dict) -> bool:
+    """Folders left out of scans: hidden folders, ignore_dirs and the outputs folder."""
+    low = name.lower()
+    ignore = {d.lower() for d in cfg["ignore_dirs"]}
+    out_dir = str(cfg.get("outputs_dir") or "").strip("/\\").lower()
+    return name.startswith(".") or low in ignore or (bool(out_dir) and low == out_dir)
+
+
 def state_path(session_id: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:120] or "nosession"
     d = Path(tempfile.gettempdir()) / TAG
@@ -215,12 +253,15 @@ def save_state(session_id: str, st: dict) -> None:
         pass
 
 
+def log_path() -> Path:
+    return guard_home() / "sprawl-guard.log"
+
+
 def log_event(st: dict, root: Path, text: str) -> None:
     st.setdefault("turn_log", []).append(text)
     try:
-        home = guard_home()
-        home.mkdir(parents=True, exist_ok=True)
-        with open(home / "sprawl-guard.log", "a", encoding="utf-8") as f:
+        guard_home().mkdir(parents=True, exist_ok=True)
+        with open(log_path(), "a", encoding="utf-8") as f:
             f.write(f"{datetime.now().isoformat(timespec='seconds')}\t{root}\t{text}\n")
     except OSError:
         pass
@@ -325,6 +366,47 @@ def most_similar(target: Path, content: str, cfg: dict) -> tuple[Path, float] | 
     return (best, best_r) if best else None
 
 
+def code_folders(root: Path, cfg: dict) -> list[str]:
+    """Top-level folders that already hold code files (for the root-folder rule)."""
+    code_exts = {e.lower() for e in cfg["code_extensions"]}
+    found = []
+    try:
+        dirs = sorted(d for d in root.iterdir() if d.is_dir() and not skip_dir(d.name, cfg))
+    except OSError:
+        return []
+    for d in dirs:
+        try:
+            for i, f in enumerate(d.iterdir()):
+                if i > 200:
+                    break
+                if f.is_file() and f.suffix.lower() in code_exts:
+                    found.append(d.name)
+                    break
+        except OSError:
+            continue
+        if len(found) >= 3:
+            break
+    return found
+
+
+def protected_match(rel: str, cfg: dict) -> str | None:
+    """Return the protected_paths entry that covers `rel`, if any."""
+    def fold(s: str) -> str:
+        return s.lower() if os.name == "nt" else s
+
+    r = fold(rel)
+    for pattern in cfg.get("protected_paths") or []:
+        p = fold(str(pattern).replace("\\", "/").strip().strip("/"))
+        if not p:
+            continue
+        if any(ch in p for ch in "*?["):
+            if fnmatch.fnmatchcase(r, p):
+                return str(pattern)
+        elif r == p or r.startswith(p + "/"):
+            return str(pattern)
+    return None
+
+
 def requested(target: Path, prompt: str, cfg: dict) -> tuple[bool, bool]:
     """(file is named in the user's prompt, prompt asks for a separate/new version)."""
     if not prompt:
@@ -342,6 +424,9 @@ def judge_new_file(target: Path, rel: str, cfg: dict, scratchpad: str | None, co
     for pattern in cfg.get("allow_paths", []):
         if fnmatch.fnmatch(rel, pattern):
             return []
+    out_dir = str(cfg.get("outputs_dir") or "").strip("/\\")
+    if out_dir and out_dir.lower() in [p.lower() for p in rel.split("/")[:-1]]:
+        return []  # inside the outputs folder anything goes
 
     findings: list[dict] = []
 
@@ -352,6 +437,18 @@ def judge_new_file(target: Path, rel: str, cfg: dict, scratchpad: str | None, co
 
     stem, ext = target.stem, target.suffix.lower()
     toks = tokens(stem)
+
+    # 0. run outputs: steered to the outputs folder; no other rule applies to them
+    is_output = ext in cfg["output_extensions"] or (
+        ext in cfg["output_data_extensions"] and any(t in cfg["output_keywords"] for t in toks))
+    if is_output:
+        where = f"{out_dir}/<run>/" if out_dir else "one outputs folder"
+        add(cfg["outputs_files"], "outputs",
+            f"'{rel}' looks like a run output (log, checkpoint or results file).",
+            f"Put run outputs in '{where}' and keep that folder in .gitignore, so results do not mix with code.",
+            alt=f"save it under '{where}'")
+        return findings
+
     allowed = {n.lower() for n in cfg["allowed_names"]}
     suffixes = list(cfg["version_suffixes"]) + list(cfg["backup_suffixes"])
     backups = {s.lower() for s in cfg["backup_suffixes"]}
@@ -436,6 +533,18 @@ def judge_new_file(target: Path, rel: str, cfg: dict, scratchpad: str | None, co
                 "Use a short descriptive name; dates and run IDs belong in configs, logs or git history.",
                 alt="use a descriptive name")
 
+    # 6. root folder: new code files at the root when code folders already exist
+    if ("/" not in rel and ext in cfg["code_extensions"] and not hidden
+            and stem.lower() not in {n.lower() for n in cfg.get("root_allowed", [])}
+            and SEVERITY.get(cfg.get("root_files"), 0) > 0):
+        folders = code_folders(target.parent, cfg)
+        if folders:
+            listed = ", ".join(f"'{d}/'" for d in folders)
+            add(cfg["root_files"], "root",
+                f"'{rel}' is a new code file at the project root.",
+                f"Put it in an existing folder such as {listed}; keep the root for entry points and config.",
+                alt=f"put it in '{folders[0]}/'")
+
     return findings
 
 
@@ -516,8 +625,11 @@ def confirm_message(rel: str, conf: list[dict]) -> str:
 
 
 def handle_pre_write(data: dict, cfg: dict) -> None:
+    tool = data.get("tool_name") or "Write"
+    if tool not in WRITE_TOOLS:
+        return
     tool_input = data.get("tool_input") or {}
-    file_path = tool_input.get("file_path")
+    file_path = tool_input.get("file_path") or tool_input.get("notebook_path")
     if not file_path:
         return
     root = project_root(data)
@@ -525,13 +637,24 @@ def handle_pre_write(data: dict, cfg: dict) -> None:
     if not target.is_absolute():
         target = Path(data.get("cwd") or root) / target
     target = target.resolve()
+    if not is_within(target, root):
+        return  # writing outside the project is never sprawl
+    rel = rel_of(target, root)
 
-    if target.exists() or not is_within(target, root):
-        return  # editing existing files, or writing outside the project, is never sprawl
+    # Protected paths: no write or edit of any kind, new or existing file.
+    pattern = protected_match(rel, cfg)
+    if pattern:
+        emit(pre_tool("deny",
+             f"[{TAG}] '{rel}' is inside a protected path ('{pattern}'). Do not create, edit or overwrite "
+             f"files there. If the user really wants this, they must first remove that entry from "
+             f"protected_paths in sprawl-guard.json."))
+        return
+
+    if tool != "Write" or target.exists():
+        return  # the sprawl rules only judge new files created with Write
     scratchpad = data.get("scratchpad_dir")
     if scratchpad and is_within(target, Path(scratchpad).resolve()):
         return
-    rel = rel_of(target, root)
     ignore = {d.lower() for d in cfg["ignore_dirs"]}
     if any(p.lower() in ignore for p in rel.split("/")[:-1]):
         return
@@ -622,22 +745,24 @@ def handle_prompt(data: dict, cfg: dict) -> None:
 
 
 def list_files(root: Path, cfg: dict) -> set[str]:
-    """Untracked-but-not-ignored files via git when possible, else a bounded walk."""
+    """New-file candidates: untracked, non-ignored files via git when possible, else a bounded walk.
+    Hidden folders, ignore_dirs and the outputs folder are always left out."""
+    def keep(rel: str) -> bool:
+        return not any(skip_dir(part, cfg) for part in rel.split("/")[:-1])
+
     try:
         res = subprocess.run(
             ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
             capture_output=True, timeout=8,
         )
         if res.returncode == 0:
-            # untracked files only: anything Claude creates shows up here, .gitignored outputs do not
-            return {p for p in res.stdout.decode("utf-8", "replace").split("\0") if p}
+            return {p for p in res.stdout.decode("utf-8", "replace").split("\0") if p and keep(p)}
     except (OSError, subprocess.SubprocessError):
         pass
-    ignore = {d.lower() for d in cfg["ignore_dirs"]}
     found: set[str] = set()
     deadline = time.monotonic() + 3.0
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d.lower() not in ignore]
+        dirnames[:] = [d for d in dirnames if not skip_dir(d, cfg)]
         rel_dir = os.path.relpath(dirpath, root)
         for name in filenames:
             rel = name if rel_dir == "." else os.path.join(rel_dir, name)
@@ -647,9 +772,53 @@ def list_files(root: Path, cfg: dict) -> set[str]:
     return found
 
 
+def find_orphans(root: Path, new: list[str], cfg: dict) -> list[str]:
+    """New code files whose name appears in no other text file of the project.
+    Returns [] when the scan cannot finish in time, so it never claims a false orphan."""
+    code_exts = {e.lower() for e in cfg["code_extensions"]}
+    skip_stems = {"__init__", "__main__", "conftest", "setup", "main"}
+    remaining: dict[str, re.Pattern] = {}
+    for rel in new:
+        p = PurePosixPath(rel)
+        stem = p.stem
+        low = stem.lower()
+        if p.suffix.lower() not in code_exts or len(stem) < 3 or low in skip_stems:
+            continue
+        if low.startswith("test_") or low.endswith("_test") or low.endswith(".test"):
+            continue
+        remaining[rel] = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(stem)}(?![A-Za-z0-9_])")
+    if not remaining:
+        return []
+    text_exts = code_exts | {".md", ".txt", ".rst", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini"}
+    deadline = time.monotonic() + 3.0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not skip_dir(d, cfg)]
+        rel_dir = os.path.relpath(dirpath, root)
+        for name in filenames:
+            if os.path.splitext(name)[1].lower() not in text_exts:
+                continue
+            rel = (name if rel_dir == "." else os.path.join(rel_dir, name)).replace("\\", "/")
+            full = os.path.join(dirpath, name)
+            try:
+                if os.path.getsize(full) > 1_000_000:
+                    continue
+                with open(full, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for cand, pattern in list(remaining.items()):
+                if cand != rel and pattern.search(text):
+                    del remaining[cand]
+            if not remaining:
+                return []
+            if time.monotonic() > deadline:
+                return []
+    return sorted(remaining)
+
+
 def handle_session_start(data: dict, cfg: dict) -> None:
     sid = data.get("session_id") or ""
-    if sid and cfg.get("stop_check", "list") != "off":
+    if sid and cfg.get("turn_check", "summary") != "off":
         st = load_state(sid)
         if st.get("snapshot") is None:
             st["snapshot"] = sorted(list_files(project_root(data), cfg))
@@ -658,35 +827,55 @@ def handle_session_start(data: dict, cfg: dict) -> None:
         emit({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": REMINDER}})
 
 
+def names(items: list[str], limit: int = 10) -> str:
+    return ", ".join(items[:limit]) + (f" (+{len(items) - limit} more)" if len(items) > limit else "")
+
+
 def handle_stop(data: dict, cfg: dict) -> None:
     sid = data.get("session_id") or ""
     if not sid:
         return
     st = load_state(sid)
-    mode = cfg.get("stop_check", "list")
+    mode = cfg.get("turn_check", "summary")
+    unattended = bool(st.get("unattended")) or truthy_env("SPRAWL_GUARD_UNATTENDED")
+    if mode == "force" and unattended:
+        mode = "summary"  # never hold up an unattended run
+    root = project_root(data)
     turn_log = st.pop("turn_log", [])
     new: list[str] = []
     if mode != "off":
-        current = list_files(project_root(data), cfg)
+        current = list_files(root, cfg)
         previous = st.get("snapshot")
         st["snapshot"] = sorted(current)
         if previous is not None:
             new = sorted(current - set(previous))
     save_state(sid, st)
+    orphans = find_orphans(root, new, cfg) if new and cfg.get("orphan_check", True) else []
 
-    shown = ", ".join(new[:10]) + (f" (+{len(new) - 10} more)" if len(new) > 10 else "")
     if mode == "force" and new and not data.get("stop_hook_active"):
+        extra = f" These are not referenced anywhere: {names(orphans)}." if orphans else ""
         emit({"decision": "block", "reason":
-              f"[{TAG}] New files were created in the project this turn: {shown}. "
+              f"[{TAG}] New files were created in the project this turn: {names(new)}.{extra} "
               "Before finishing, merge any that duplicate existing files back into them and delete "
               "throwaway ones; keep files the user explicitly asked for. Then say which you kept."})
         return
+
     parts = []
     if new:
-        parts.append(f"{len(new)} new file(s) this turn: {shown}")
+        line = f"{len(new)} new file(s) this turn"
+        if orphans:
+            line += f", {len(orphans)} not referenced anywhere"
+        if mode == "list":
+            line += f": {names(new)}"
+            if orphans:
+                line += f" (not referenced: {names(orphans)})"
+        parts.append(line)
     if turn_log:
-        parts.append("allowed because unattended (logged): " + "; ".join(turn_log[:10]))
-    if st.get("unattended") or truthy_env("SPRAWL_GUARD_UNATTENDED"):
+        if mode == "list":
+            parts.append("allowed because unattended: " + "; ".join(turn_log[:10]))
+        else:
+            parts.append(f"{len(turn_log)} allowed because unattended (details in {log_path()})")
+    if unattended:
         parts.append("unattended mode was on")
     if parts:
         emit({"systemMessage": f"[{TAG}] " + " | ".join(parts)})

@@ -58,9 +58,9 @@ class Base(unittest.TestCase):
     def prompt(self, text, **env):
         return run("prompt", {"session_id": self.session, "cwd": str(self.root), "prompt": text}, env)
 
-    def write(self, rel, content="...", env=None, **extra):
+    def write(self, rel, content="...", env=None, tool="Write", **extra):
         payload = {"session_id": self.session, "cwd": str(self.root), "hook_event_name": "PreToolUse",
-                   "tool_name": "Write", "tool_input": {"file_path": str(self.root / rel), "content": content}}
+                   "tool_name": tool, "tool_input": {"file_path": str(self.root / rel), "content": content}}
         payload.update(extra)
         return run("pre-write", payload, env)
 
@@ -167,7 +167,8 @@ class VersionedCopies(Base):
         self.prompt("create README_v2.md, I'll be away so work autonomously")
         self.assertIsNone(self.write("README_v2.md"))
         msg = self.stop()["systemMessage"]
-        self.assertIn("README_v2.md", msg)
+        self.assertIn("1 allowed because unattended", msg)
+        self.assertNotIn("README_v2.md", msg)  # summary mode: no file names
         self.assertIn("unattended mode was on", msg)
         self.assertIn("README_v2.md", (Path(HOME) / "sprawl-guard.log").read_text())
 
@@ -377,7 +378,8 @@ class Budget(Base):
         self.prompt("work on this overnight")
         self.write("alpha.py")
         self.assertIsNone(self.write("beta.py"))
-        self.assertIn("budget 1", self.stop()["systemMessage"])
+        self.assertIn("allowed because unattended", self.stop()["systemMessage"])
+        self.assertIn("budget 1", (Path(HOME) / "sprawl-guard.log").read_text())
 
     def test_budget_off(self):
         self.config(file_budget=0)
@@ -409,44 +411,220 @@ class Context(Base):
         self.assertIsNone(self.prompt("hi"))
 
 
-class StopCheck(Base):
-    def test_lists_new_files_once(self):
+class TurnCheck(Base):
+    def test_summary_by_default_without_names(self):
         self.touch("existing.py")
         self.start()
         self.touch("made_by_claude.py")
-        out = self.stop()
-        self.assertIn("made_by_claude.py", out["systemMessage"])
-        self.assertNotIn("existing.py", out["systemMessage"])
-        self.assertIsNone(self.stop())
+        msg = self.stop()["systemMessage"]
+        self.assertIn("1 new file(s) this turn", msg)
+        self.assertNotIn("made_by_claude.py", msg)
+        self.assertIsNone(self.stop())  # already reported
+
+    def test_list_mode_shows_names(self):
+        self.config(turn_check="list")
+        self.touch("existing.py")
+        self.start()
+        self.touch("made_by_claude.py")
+        msg = self.stop()["systemMessage"]
+        self.assertIn("made_by_claude.py", msg)
+        self.assertNotIn("existing.py", msg)
 
     def test_nothing_new_is_silent(self):
         self.start()
         self.assertIsNone(self.stop())
 
+    def test_off(self):
+        self.config(turn_check="off")
+        self.start()
+        self.touch("a.py")
+        self.assertIsNone(self.stop())
+
+    def test_old_stop_check_key_still_works(self):
+        self.config(stop_check="off")
+        self.start()
+        self.touch("a.py")
+        self.assertIsNone(self.stop())
+
+    def test_hidden_folders_skipped(self):
+        # the v0.2 problem: thousands of files under .antigravity-server and .gemini in a home folder
+        self.start()
+        for i in range(30):
+            self.touch(f".antigravity-server/extensions/ext{i}/out.js")
+        self.touch(".gemini/antigravity-ide/crashes/crash.log")
+        self.assertIsNone(self.stop())
+
+    @unittest.skipUnless(HAS_GIT, "git not installed")
+    def test_hidden_folders_skipped_in_git_repo(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.start()
+        self.touch(".cache/tool/state.json")
+        self.assertIsNone(self.stop())
+
+    def test_outputs_and_env_folders_skipped(self):
+        self.start()
+        self.touch("outputs/run1/model.pt")
+        self.touch("wandb/run-1/files/config.yaml")
+        self.touch("miniconda3/lib/x.py")
+        self.assertIsNone(self.stop())
+
     def test_force_mode_blocks_once(self):
-        self.config(stop_check="force")
+        self.config(turn_check="force")
         self.start()
         self.touch("helper.py")
         self.assertEqual(self.stop()["decision"], "block")
         self.touch("another.py")
         self.assertIn("systemMessage", self.stop(stop_hook_active=True))
 
+    def test_force_mode_off_when_unattended(self):
+        self.config(turn_check="force")
+        self.start()
+        self.prompt("work autonomously until done")
+        self.touch("helper.py")
+        out = self.stop()
+        self.assertNotIn("decision", out)
+        self.assertIn("unattended mode was on", out["systemMessage"])
+
     @unittest.skipUnless(HAS_GIT, "git not installed")
     def test_git_repo_respects_gitignore(self):
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
-        self.touch(".gitignore", "outputs/\n")
+        self.touch(".gitignore", "checkpoints/\n")
+        self.config(turn_check="list")
         self.start()
-        self.touch("outputs/checkpoint.pt")
+        self.touch("checkpoints/best.pt")
         self.touch("new_module.py")
         msg = self.stop()["systemMessage"]
         self.assertIn("new_module.py", msg)
-        self.assertNotIn("checkpoint", msg)
+        self.assertNotIn("best.pt", msg)
 
     def test_missing_snapshot_starts_tracking(self):
         self.touch("a.py")
         self.assertIsNone(self.stop())
         self.touch("b.py")
-        self.assertIn("b.py", self.stop()["systemMessage"])
+        self.assertIn("1 new file(s)", self.stop()["systemMessage"])
+
+
+class Orphans(Base):
+    def test_unreferenced_code_counted(self):
+        self.start()
+        self.touch("math_ops.py", "def add(a, b):\n    return a + b\n")
+        self.touch("pipeline.py", "from math_ops import add\n")
+        msg = self.stop()["systemMessage"]
+        self.assertIn("2 new file(s) this turn, 1 not referenced anywhere", msg)
+
+    def test_list_mode_names_orphans(self):
+        self.config(turn_check="list")
+        self.start()
+        self.touch("math_ops.py", "x = 1\n")
+        self.touch("pipeline.py", "import math_ops\n")
+        msg = self.stop()["systemMessage"]
+        self.assertIn("not referenced: pipeline.py", msg)
+
+    def test_mention_in_readme_counts_as_reference(self):
+        self.touch("README.md", "Run `python evaluate.py` to evaluate.\n")
+        self.start()
+        self.touch("evaluate.py", "print(1)\n")
+        self.assertNotIn("not referenced", self.stop()["systemMessage"])
+
+    def test_tests_and_non_code_ignored(self):
+        self.start()
+        self.touch("test_model.py", "x = 1\n")
+        self.touch("notes.md", "x\n")
+        self.assertNotIn("not referenced", self.stop()["systemMessage"])
+
+    def test_can_be_disabled(self):
+        self.config(orphan_check=False)
+        self.start()
+        self.touch("lonely.py", "x = 1\n")
+        self.assertNotIn("not referenced", self.stop()["systemMessage"])
+
+
+class Outputs(Base):
+    def test_checkpoint_and_log_warn(self):
+        for name in ("model.pt", "train.log", "weights.safetensors"):
+            out = self.write(name)
+            self.assertEqual(self.decision(out), "warn", name)
+            self.assertIn("outputs/<run>/", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_results_data_files_warn(self):
+        self.assertEqual(self.decision(self.write("results.csv")), "warn")
+        self.assertEqual(self.decision(self.write("eval_metrics.json")), "warn")
+        self.assertEqual(self.decision(self.write("results.txt")), "warn")  # not treated as a report
+
+    def test_plain_data_and_config_not_flagged(self):
+        self.assertIsNone(self.write("data/train.csv"))
+        self.assertIsNone(self.write("config.json"))
+
+    def test_inside_outputs_folder_anything_goes(self):
+        self.assertIsNone(self.write("outputs/run1/model.pt"))
+        self.assertIsNone(self.write("outputs/run1/debug_notes_final_v2.txt"))
+
+    def test_custom_outputs_dir(self):
+        self.config(outputs_dir="runs")
+        self.assertIsNone(self.write("runs/exp3/metrics.json"))
+        self.assertIn("runs/<run>/", self.write("metrics.json")["hookSpecificOutput"]["additionalContext"])
+
+
+class RootFolder(Base):
+    def test_off_by_default(self):
+        self.touch("src/model.py")
+        self.assertIsNone(self.write("helpers.py"))
+
+    def test_warn_points_to_existing_code_folder(self):
+        self.config(root_files="warn")
+        self.touch("src/model.py")
+        out = self.write("helpers.py")
+        self.assertEqual(self.decision(out), "warn")
+        self.assertIn("'src/'", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_no_code_folders_no_warning(self):
+        self.config(root_files="warn")
+        self.touch("docs/guide.md")
+        self.assertIsNone(self.write("helpers.py"))
+
+    def test_entry_points_and_nested_files_allowed(self):
+        self.config(root_files="warn")
+        self.touch("src/model.py")
+        self.assertIsNone(self.write("main.py"))
+        self.assertIsNone(self.write("src/layers.py"))
+
+
+class Protected(Base):
+    def test_new_file_in_protected_glob_denied(self):
+        self.config(protected_paths=["data/raw/**"])
+        out = self.write("data/raw/extra.csv")
+        self.assertEqual(self.decision(out), "deny")
+        self.assertIn("protected path", self.reason(out))
+
+    def test_edit_of_existing_file_denied(self):
+        self.config(protected_paths=["data/raw/**"])
+        self.touch("data/raw/ecg.csv")
+        self.assertEqual(self.decision(self.write("data/raw/ecg.csv", tool="Edit")), "deny")
+        self.assertEqual(self.decision(self.write("data/raw/ecg.csv", tool="Write")), "deny")
+
+    def test_plain_folder_entry_covers_subfolders(self):
+        self.config(protected_paths=["results/final"])
+        self.assertEqual(self.decision(self.write("results/final/table.tex")), "deny")
+        self.assertIsNone(self.write("results/draft/table.tex"))
+
+    def test_protected_even_when_named_or_unattended(self):
+        self.config(protected_paths=["data/raw"])
+        self.prompt("overwrite data/raw/ecg.csv, work autonomously")
+        self.assertEqual(self.decision(self.write("data/raw/ecg.csv")), "deny")
+
+    def test_edits_elsewhere_untouched(self):
+        self.config(protected_paths=["data/raw/**"])
+        self.touch("train.py")
+        self.assertIsNone(self.write("train.py", tool="Edit"))
+
+    def test_edit_tool_never_runs_sprawl_rules(self):
+        self.touch("train_v2.py")
+        self.assertIsNone(self.write("train_v2.py", tool="Edit"))
+        self.assertIsNone(self.write("nb.ipynb", tool="NotebookEdit"))
+
+    def test_other_tools_ignored(self):
+        self.config(protected_paths=["data/raw/**"])
+        self.assertIsNone(self.write("data/raw/x.csv", tool="Read"))
 
 
 class Installer(unittest.TestCase):
@@ -463,6 +641,7 @@ class Installer(unittest.TestCase):
             self.assertEqual(data["model"], "x")
             self.assertEqual(len(data["hooks"]["PreToolUse"]), 2)
             self.assertEqual(set(data["hooks"]), {"PreToolUse", "UserPromptSubmit", "SessionStart", "Stop"})
+            self.assertEqual(data["hooks"]["PreToolUse"][1]["matcher"], "Write|Edit|MultiEdit|NotebookEdit")
             subprocess.run([sys.executable, str(installer), "--project", proj, "--uninstall"],
                            check=True, capture_output=True)
             data = json.loads(settings.read_text())

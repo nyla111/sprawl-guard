@@ -24,7 +24,7 @@ MARKER = "sprawl_guard.py"
 
 # (event, matcher or None, script argument, timeout seconds)
 HOOKS = [
-    ("PreToolUse", "Write", "pre-write", 20),
+    ("PreToolUse", "Write|Edit|MultiEdit|NotebookEdit", "pre-write", 20),
     ("UserPromptSubmit", None, "prompt", 10),
     ("SessionStart", None, "session-start", 15),
     ("Stop", None, "stop", 15),

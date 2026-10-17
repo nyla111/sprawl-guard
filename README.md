@@ -1,7 +1,8 @@
 # sprawl-guard
 
 Stops Claude Code from cluttering your workspace with `train_v2.py`, `train_resnet.py`,
-`paper_final.tex`, `IMPLEMENTATION_SUMMARY.md`, `utils2.py` and throwaway `debug_*.py` scripts.
+`paper_final.tex`, `IMPLEMENTATION_SUMMARY.md`, `utils2.py`, stray `results.csv` files and
+throwaway `debug_*.py` scripts.
 
 Rules in CLAUDE.md fade in long sessions and after compaction. sprawl-guard uses Claude Code
 **hooks**, so the checks run on every new file, however deep the session is. The checks run
@@ -21,15 +22,17 @@ Every rule has a mode:
 
 **If you named the file in your prompt** (or asked for "a new version", "a separate file",
 "keep the original"...), rules that would `deny` become `confirm`: you get asked instead of
-Claude silently doing something else. Backups are the exception and are always denied.
+Claude silently doing something else. Backups and protected paths are the exceptions and are
+always denied.
 
 **Unattended mode.** Say it in your prompt ("work autonomously", "I'll be away", "overnight",
 "don't ask me", "until done", or the tag `#unattended`), or set the environment variable
 `SPRAWL_GUARD_UNATTENDED=1`. While on, `confirm` and `ask` never interrupt: the file is allowed
-and logged to `~/.claude/sprawl-guard.log`, and the end-of-turn message lists it. `deny` rules
-still apply because Claude can fix those without you. It switches off with your next normal prompt.
+and logged to `~/.claude/sprawl-guard.log`, and the end-of-turn summary counts it. `deny` rules
+still apply because Claude can fix those without you, and `force` mode of the turn check is
+switched off. It switches off with your next normal prompt.
 
-## Rules
+## Rules for new files
 
 | Rule | Example | Default |
 |---|---|---|
@@ -43,23 +46,51 @@ still apply because Claude can fix those without you. It switches off with your 
 | `oneoff_scripts` | `debug_*`, `tmp_*`, `scratch*`, `quick_test*` | `deny`: use the session scratchpad |
 | `long_names` | over 30 characters or more than 3 `_`/`-`/`.` separators | `deny`: rename shorter |
 | `generic_names` | `utils2`, `misc`, `helper_new`, `main2`, dates in names | `deny` |
+| `outputs_files` | `model.pt`, `train.log`, `results.csv`, `eval_metrics.json` outside `outputs/` | `warn`: save under `outputs/<run>/` |
+| `root_files` | new `helpers.py` at the project root when `src/` already holds code | `off` (turn on with `warn` or `deny`) |
 | `file_budget` | more than 10 new files in one session | `ask` |
+
+**Outputs folder.** Run outputs (logs, checkpoints, results files) belong in one folder,
+`outputs/<run>/` by default, which you keep in `.gitignore`. No rules apply inside it, and it is
+left out of the end-of-turn summary. Change the name with `"outputs_dir"`.
+
+**Protected paths.** Folders Claude must never write into, such as raw data or finished
+results: `"protected_paths": ["data/raw/**", "results/final"]`. A plain folder name covers
+everything below it. This blocks creating, editing and overwriting files there, also when you
+name the file or run unattended. Remove the entry from the config if you really need a change.
 
 **Git checkpoint.** Before Claude merges into an original file, sprawl-guard makes a local
 commit of just that file (`sprawl-guard: checkpoint train.py before in-place edit`), so the old
 version stays recoverable. It never pushes, never commits other staged files, and skips
 during a merge or rebase. Turn off with `"git_checkpoint": false`.
 
-**Always allowed:** editing existing files; standard repo files (README, LICENSE, CHANGELOG,
-CLAUDE.md, AGENTS.md, requirements.txt, ...); anything outside the project, in the scratchpad,
-or in `.git`, `.claude`, `node_modules`, `venv`, `build` and similar folders.
+**Always allowed:** editing existing files (except in protected paths); standard repo files
+(README, LICENSE, CHANGELOG, CLAUDE.md, AGENTS.md, requirements.txt, ...); anything outside the
+project, in the scratchpad, or in `.git`, `.claude`, `node_modules`, `venv`, `build`, `wandb`
+and similar folders.
+
+## End-of-turn check (`turn_check`)
+
+When Claude finishes a turn, sprawl-guard compares the project with the snapshot from before
+the turn. This also catches files created through shell commands, which the write check cannot
+see. It runs after Claude has finished and only shows you a message, so it never interrupts
+work. Hidden folders (`.gemini`, `.cache`, ...), ignored folders and the outputs folder are
+skipped.
+
+| Mode | What you see |
+|---|---|
+| `summary` (default) | One line: `[sprawl-guard] 3 new file(s) this turn, 1 not referenced anywhere` |
+| `list` | The same, plus file names (up to 10) |
+| `force` | Claude must merge or delete new files before it can finish (once per turn; off while unattended) |
+| `off` | Nothing |
+
+"Not referenced anywhere" is the orphan check: new code files whose name appears in no other
+file of the project, which are often dead code. Test files are skipped, and a mention in the
+README counts as a reference. Turn it off with `"orphan_check": false`.
 
 **Context.** No per-prompt reminder. The rules are restated only after compaction
-(about 40 tokens) and inside each block message. Set `"reminder": "always"` to restate them
+(about 45 tokens) and inside each block message. Set `"reminder": "always"` to restate them
 on every prompt, or `"off"`.
-
-**End of turn.** You see a list of files created that turn (including ones made through Bash)
-and anything allowed in unattended mode. This is shown to you, not added to Claude's context.
 
 ## Install
 
@@ -93,7 +124,7 @@ locally on the machine where Claude Code runs.
    Use `python` instead of `python3` on Windows. The installer records the exact Python you ran
    it with, so run it with the interpreter you want the hooks to use.
 
-4. **Restart Claude Code** (`/exit`, then `claude`) and run `/hooks` to check the four hooks
+4. **Restart Claude Code** (`/exit`, then `claude`) and run `/hooks` to check the hooks
    are listed. If the list is empty, you started Claude Code in a different folder than the one
    you installed into (project installs apply only to that folder).
 
@@ -108,8 +139,24 @@ cd ~/tools/sprawl-guard
 git pull
 ```
 
-Script changes apply from the next Claude Code session. Run `install.py` again only if a release
-adds or changes hooks (the release notes will say so).
+Script changes apply from the next Claude Code session. Run `install.py` again when
+[CHANGELOG.md](CHANGELOG.md) says so for that release (v0.3 does).
+
+## Configure
+
+Copy `sprawl-guard.example.json` to `~/.claude/sprawl-guard.json` (all projects) or
+`<project>/.claude/sprawl-guard.json` (one project, overrides the global file), and keep only
+the keys you want to change. `allow_paths` takes globs that are always allowed, e.g.
+`["docs/**"]`. Word and extension lists (`report_keywords`, `version_suffixes`,
+`backup_suffixes`, `oneoff_prefixes`, `generic_patterns`, `output_extensions`,
+`output_keywords`, `request_keywords`, `unattended_keywords`, ...) can be replaced the same way;
+see the top of `sprawl_guard.py`.
+
+## Turn it off
+
+- One session: start Claude Code with `SPRAWL_GUARD=off`.
+- One project: `{"enabled": false}` in `<project>/.claude/sprawl-guard.json`.
+- Completely: `python install.py --uninstall` (add `--project PATH` if installed per project).
 
 ## Repository layout
 
@@ -117,23 +164,9 @@ adds or changes hooks (the release notes will say so).
 |---|---|
 | `sprawl_guard.py` | The guard: one script that handles all four hook events |
 | `install.py` | Adds or removes the hooks in a Claude Code settings file |
-| `sprawl-guard.example.json` | Example config with every option and its default |
+| `sprawl-guard.example.json` | Example config with the main options and their defaults |
 | `test_sprawl_guard.py` | Test suite (feeds the script real hook JSON in temporary folders) |
-
-## Configure
-
-Copy `sprawl-guard.example.json` to `~/.claude/sprawl-guard.json` (all projects) or
-`<project>/.claude/sprawl-guard.json` (one project, overrides the global file), and keep only
-the keys you want to change. `allow_paths` takes globs that are always allowed, e.g.
-`["docs/**"]`. Word lists (`report_keywords`, `version_suffixes`, `backup_suffixes`,
-`oneoff_prefixes`, `generic_patterns`, `request_keywords`, `unattended_keywords`, ...) can be
-replaced the same way; see the top of `sprawl_guard.py`.
-
-## Turn it off
-
-- One session: start Claude Code with `SPRAWL_GUARD=off`.
-- One project: `{"enabled": false}` in `<project>/.claude/sprawl-guard.json`.
-- Completely: `python install.py --uninstall` (add `--project PATH` if installed per project).
+| `CHANGELOG.md` | What changed in each release, and when to re-run the installer |
 
 ## Test
 
@@ -143,9 +176,10 @@ python -m unittest test_sprawl_guard -v
 
 Set `SPRAWL_GUARD_DEBUG=1` to print each decision to the hook debug log.
 
-## Known limits (v0.2)
+## Known limits
 
-- Files created through Bash (`cat > x.md`) are only reported at the end of the turn, not blocked.
+- Files created through shell commands are not blocked, only counted at the end of the turn.
+  Protected paths are enforced for Claude's file tools, not for shell commands.
 - Detection is name- and content-based heuristics. Unattended and "new version" detection use
   keyword lists; adjust them in the config if they misfire.
 - Whether the one-time `ask` prompt appears in auto mode depends on Claude Code's permission
