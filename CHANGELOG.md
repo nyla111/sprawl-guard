@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.4.0 - 2026-10-22
+
+**Re-run the installer after updating** (`python3 install.py`, plus `--project PATH` if you
+installed per project) to get the `/tidy` command, then restart Claude Code.
+
+Added:
+- `/tidy` command: scans the project for existing sprawl (versioned copies, backups,
+  near-copies, one-off scripts, report files) and has Claude merge or remove it with you,
+  group by group, with a git checkpoint first. The scan alone: `python3 sprawl_guard.py tidy`.
+
+Changed:
+- The turn summary counts files created, edited and deleted, not only created:
+  `Files this turn: 3 created, 2 edited, 1 deleted`. `list` mode names each kind.
+- The `[sprawl-guard]` tag is gone from the turn summary; Claude Code already puts its own
+  label (`Stop says:`) in front of hook messages, and that label cannot be changed by a hook.
+- The snapshot is taken when you send a prompt, so changes you make between turns are not
+  counted, and it is kept in its own file next to the session state.
+
 ## v0.3.0 - 2026-10-17
 
 **Re-run the installer after updating** (`python3 install.py`, plus `--project PATH` if you

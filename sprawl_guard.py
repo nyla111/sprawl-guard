@@ -4,9 +4,13 @@
 One script, four hook events (pass the event as the first argument):
   pre-write      PreToolUse on Write/Edit - protected paths for every write or edit;
                  all other rules for every NEW file created with Write
-  prompt         UserPromptSubmit         - records the prompt (named files, unattended mode); silent by default
+  prompt         UserPromptSubmit         - records the prompt (named files, unattended mode) and snapshots
+                                           the project for the turn summary; silent by default
   session-start  SessionStart             - snapshots the workspace; re-adds the rules after compaction
-  stop           Stop                     - end-of-turn summary of new files (turn_check)
+  stop           Stop                     - end-of-turn summary of files created, edited and deleted (turn_check)
+
+Command line (not a hook):
+  tidy [folder] [--json]                  - list existing sprawl; used by the /tidy command
 
 Rule modes:
   deny     blocked; Claude fixes it itself (merge into the original, rename, use the scratchpad)
@@ -26,6 +30,7 @@ import fnmatch
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,7 +38,7 @@ import time
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 TAG = "sprawl-guard"
 
 # ---------------------------------------------------------------------------
@@ -739,37 +744,114 @@ def handle_prompt(data: dict, cfg: dict) -> None:
     st = load_state(sid)
     st["prompt"] = prompt
     st["unattended"] = any(k in prompt for k in cfg["unattended_keywords"])
+    st.pop("snapshot", None)  # v0.3 format; the snapshot now lives in its own file
     save_state(sid, st)
+    if cfg.get("turn_check", "summary") != "off" and data.get("session_id"):
+        # snapshot at the start of the turn, so changes you made between turns are not counted
+        take_snapshot(sid, project_root(data), cfg)
     if cfg.get("reminder") == "always":
         emit({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": REMINDER}})
 
 
-def list_files(root: Path, cfg: dict) -> set[str]:
-    """New-file candidates: untracked, non-ignored files via git when possible, else a bounded walk.
+MAX_SCAN_FILES = 50000
+
+
+def scan_files(root: Path, cfg: dict, budget: float = 3.0) -> tuple[dict[str, list[int]], bool]:
+    """Project files with [mtime_ns, size], and whether the scan finished.
+    In a git repo: tracked plus untracked, non-ignored files. Otherwise a bounded walk.
     Hidden folders, ignore_dirs and the outputs folder are always left out."""
     def keep(rel: str) -> bool:
         return not any(skip_dir(part, cfg) for part in rel.split("/")[:-1])
 
+    deadline = time.monotonic() + budget
+    out: dict[str, list[int]] = {}
+    rels: set[str] | None = None
     try:
         res = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
-            capture_output=True, timeout=8,
+            ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            capture_output=True, timeout=5,
         )
         if res.returncode == 0:
-            return {p for p in res.stdout.decode("utf-8", "replace").split("\0") if p and keep(p)}
+            rels = {p for p in res.stdout.decode("utf-8", "replace").split("\0") if p and keep(p)}
     except (OSError, subprocess.SubprocessError):
-        pass
-    found: set[str] = set()
-    deadline = time.monotonic() + 3.0
+        rels = None
+    if rels is not None:
+        if len(rels) > MAX_SCAN_FILES:
+            return out, False
+        for i, rel in enumerate(sorted(rels)):
+            if i % 256 == 0 and time.monotonic() > deadline:
+                return out, False
+            try:
+                s = os.stat(os.path.join(root, rel))
+            except OSError:
+                continue  # tracked but deleted from disk
+            if stat.S_ISREG(s.st_mode):
+                out[rel] = [s.st_mtime_ns, s.st_size]
+        return out, True
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if not skip_dir(d, cfg)]
         rel_dir = os.path.relpath(dirpath, root)
         for name in filenames:
-            rel = name if rel_dir == "." else os.path.join(rel_dir, name)
-            found.add(rel.replace("\\", "/"))
-        if len(found) > 50000 or time.monotonic() > deadline:
-            break
-    return found
+            rel = (name if rel_dir == "." else os.path.join(rel_dir, name)).replace("\\", "/")
+            try:
+                s = os.stat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if stat.S_ISREG(s.st_mode):
+                out[rel] = [s.st_mtime_ns, s.st_size]
+        if len(out) > MAX_SCAN_FILES or time.monotonic() > deadline:
+            return out, False
+    return out, True
+
+
+def list_files(root: Path, cfg: dict) -> set[str]:
+    return set(scan_files(root, cfg)[0])
+
+
+def snapshot_path(session_id: str) -> Path:
+    p = state_path(session_id)
+    return p.with_name(p.name[: -len(".json")] + ".snap.json")
+
+
+def load_snapshot(session_id: str, st: dict) -> dict | None:
+    """{"files": {rel: [mtime_ns, size] | None}, "complete": bool}, or None before the first one."""
+    try:
+        with open(snapshot_path(session_id), encoding="utf-8") as f:
+            snap = json.load(f)
+        if isinstance(snap, dict) and isinstance(snap.get("files"), dict):
+            return snap
+    except (OSError, ValueError):
+        pass
+    old = st.get("snapshot")  # v0.3 kept a plain list of names inside the state file
+    if isinstance(old, list):
+        return {"files": {p: None for p in old}, "complete": True}
+    return None
+
+
+def save_snapshot(session_id: str, files: dict, complete: bool) -> None:
+    try:
+        p = snapshot_path(session_id)
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"files": files, "complete": complete}, f)
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def take_snapshot(session_id: str, root: Path, cfg: dict) -> tuple[dict, bool]:
+    files, complete = scan_files(root, cfg)
+    save_snapshot(session_id, files, complete)
+    return files, complete
+
+
+def compare(prev: dict, cur: dict) -> tuple[list[str], list[str], list[str]]:
+    """(created, edited, deleted). Files without a recorded mtime are never counted as edited."""
+    created = sorted(set(cur) - set(prev))
+    deleted = sorted(set(prev) - set(cur))
+    edited = sorted(p for p in set(cur) & set(prev)
+                    if prev[p] is not None and list(prev[p]) != list(cur[p]))
+    return created, edited, deleted
 
 
 def find_orphans(root: Path, new: list[str], cfg: dict) -> list[str]:
@@ -819,10 +901,8 @@ def find_orphans(root: Path, new: list[str], cfg: dict) -> list[str]:
 def handle_session_start(data: dict, cfg: dict) -> None:
     sid = data.get("session_id") or ""
     if sid and cfg.get("turn_check", "summary") != "off":
-        st = load_state(sid)
-        if st.get("snapshot") is None:
-            st["snapshot"] = sorted(list_files(project_root(data), cfg))
-            save_state(sid, st)
+        if load_snapshot(sid, load_state(sid)) is None:
+            take_snapshot(sid, project_root(data), cfg)
     if data.get("source") == "compact" and cfg.get("reminder") in ("compact", "always"):
         emit({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": REMINDER}})
 
@@ -843,12 +923,15 @@ def handle_stop(data: dict, cfg: dict) -> None:
     root = project_root(data)
     turn_log = st.pop("turn_log", [])
     new: list[str] = []
+    edited: list[str] = []
+    deleted: list[str] = []
     if mode != "off":
-        current = list_files(root, cfg)
-        previous = st.get("snapshot")
-        st["snapshot"] = sorted(current)
-        if previous is not None:
-            new = sorted(current - set(previous))
+        previous = load_snapshot(sid, st)
+        current, complete = take_snapshot(sid, root, cfg)
+        # an unfinished scan on either side would report false changes, so it reports none
+        if previous is not None and previous.get("complete", True) and complete:
+            new, edited, deleted = compare(previous["files"], current)
+    st.pop("snapshot", None)
     save_state(sid, st)
     orphans = find_orphans(root, new, cfg) if new and cfg.get("orphan_check", True) else []
 
@@ -861,14 +944,17 @@ def handle_stop(data: dict, cfg: dict) -> None:
         return
 
     parts = []
-    if new:
-        line = f"{len(new)} new file(s) this turn"
+    counts = [f"{len(items)} {label}" for items, label in
+              ((new, "created"), (edited, "edited"), (deleted, "deleted")) if items]
+    if counts:
+        line = "Files this turn: " + ", ".join(counts)
         if orphans:
-            line += f", {len(orphans)} not referenced anywhere"
+            line += f"; {len(orphans)} new file(s) not referenced anywhere"
         if mode == "list":
-            line += f": {names(new)}"
-            if orphans:
-                line += f" (not referenced: {names(orphans)})"
+            listed = [f"{label}: {names(items)}" for items, label in
+                      ((new, "created"), (edited, "edited"), (deleted, "deleted"),
+                       (orphans, "not referenced")) if items]
+            line += " (" + "; ".join(listed) + ")"
         parts.append(line)
     if turn_log:
         if mode == "list":
@@ -878,7 +964,249 @@ def handle_stop(data: dict, cfg: dict) -> None:
     if unattended:
         parts.append("unattended mode was on")
     if parts:
-        emit({"systemMessage": f"[{TAG}] " + " | ".join(parts)})
+        # No tag: Claude Code already labels hook messages with the event ("Stop says: ...")
+        emit({"systemMessage": " | ".join(parts)})
+
+
+# ---------------------------------------------------------------------------
+# /tidy: find sprawl that already exists
+# ---------------------------------------------------------------------------
+
+def file_info(root: Path, rel: str, tracked: set[str] | None) -> dict:
+    info: dict = {"path": rel}
+    full = root / rel
+    try:
+        s = full.stat()
+        info["modified"] = datetime.fromtimestamp(s.st_mtime).strftime("%Y-%m-%d %H:%M")
+        if s.st_size <= 2_000_000:
+            with open(full, "rb") as f:
+                info["lines"] = f.read().count(b"\n")
+    except OSError:
+        pass
+    if tracked is not None:
+        info["tracked"] = rel in tracked
+    return info
+
+
+def git_tracked(root: Path) -> set[str] | None:
+    try:
+        r = git(root, "ls-files", "-z")
+        if r.returncode == 0:
+            return {p for p in r.stdout.decode("utf-8", "replace").split("\0") if p}
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def similar_groups(root: Path, rels: list[str], cfg: dict, deadline: float) -> list[dict]:
+    """Groups of files in one folder that are mostly identical (union of similar pairs)."""
+    thr = float(cfg.get("similarity_threshold", 0.6))
+    min_lines = int(cfg.get("similarity_min_lines", 10))
+    buckets: dict[tuple[str, str], list[str]] = {}
+    for rel in rels:
+        p = PurePosixPath(rel)
+        buckets.setdefault((str(p.parent), p.suffix.lower()), []).append(rel)
+    groups: list[dict] = []
+    for (_, _), members in sorted(buckets.items()):
+        if len(members) < 2:
+            continue
+        texts: dict[str, list[str]] = {}
+        for rel in members[:80]:
+            try:
+                if (root / rel).stat().st_size > 300_000:
+                    continue
+                text = (root / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if len(lines) >= min_lines:
+                texts[rel] = lines
+        keys = sorted(texts)
+        parent = {k: k for k in keys}
+
+        def find(k: str) -> str:
+            while parent[k] != k:
+                parent[k] = parent[parent[k]]
+                k = parent[k]
+            return k
+
+        best: dict[frozenset, float] = {}
+        for i, a in enumerate(keys):
+            if time.monotonic() > deadline:
+                break
+            for b in keys[i + 1:]:
+                sm = difflib.SequenceMatcher(None, texts[a], texts[b], autojunk=False)
+                if sm.real_quick_ratio() < thr or sm.quick_ratio() < thr:
+                    continue
+                r = sm.ratio()
+                if r >= thr:
+                    best[frozenset((a, b))] = r
+                    parent[find(a)] = find(b)
+        clusters: dict[str, list[str]] = {}
+        for k in keys:
+            clusters.setdefault(find(k), []).append(k)
+        for files in clusters.values():
+            if len(files) < 2:
+                continue
+            ratios = [r for pair, r in best.items() if pair <= set(files)]
+            groups.append({"files": sorted(files), "similarity": round(max(ratios) * 100)})
+    return groups
+
+
+def tidy_scan(root: Path, scope: Path, cfg: dict) -> dict:
+    """Existing sprawl under `scope`: versioned/backup groups, near-copies, one-off scripts, reports."""
+    files, complete = scan_files(root, cfg, budget=20.0)
+    scope_rel = rel_of(scope, root).strip("/")
+    if scope_rel in ("", "."):
+        scope_rel = ""
+    tracked = git_tracked(root)
+    protected: list[str] = []
+    rels: list[str] = []
+    for rel in sorted(files):
+        if scope_rel and not (rel == scope_rel or rel.startswith(scope_rel + "/")):
+            continue
+        if any(fnmatch.fnmatch(rel, p) for p in cfg.get("allow_paths", [])):
+            continue
+        if protected_match(rel, cfg):
+            protected.append(rel)
+            continue
+        rels.append(rel)
+
+    on = lambda key: SEVERITY.get(cfg.get(key), 0) > 0  # noqa: E731
+    suffixes = list(cfg["version_suffixes"]) + list(cfg["backup_suffixes"])
+    backups = {s.lower() for s in cfg["backup_suffixes"]}
+    allowed = {n.lower() for n in cfg["allowed_names"]}
+    used: set[str] = set()
+
+    # 1. versioned copies and backups: same folder, same extension, same base name
+    by_base: dict[tuple[str, str, str], list[tuple[str, list[str]]]] = {}
+    for rel in rels:
+        p = PurePosixPath(rel)
+        base, removed = strip_version(p.stem, suffixes)
+        by_base.setdefault((str(p.parent), base.lower(), p.suffix.lower()), []).append((rel, removed))
+    versioned: list[dict] = []
+    for key in sorted(by_base):
+        members = by_base[key]
+        if len(members) < 2 or not any(removed for _, removed in members):
+            continue
+        is_backup = any(s in backups for _, removed in members for s in removed)
+        if not on("backup_files" if is_backup else "versioned_files"):
+            continue
+        originals = [rel for rel, removed in members if not removed]
+        copies = [rel for rel, removed in members if removed]
+        versioned.append({
+            "kind": "backup" if is_backup else "versioned",
+            "original": originals[0] if originals else None,
+            "copies": copies,
+            "files": [file_info(root, rel, tracked) for rel, _ in sorted(members)],
+        })
+        used.update(rel for rel, _ in members)
+
+    deadline = time.monotonic() + 15.0
+    rest = [r for r in rels if r not in used]
+    doc_exts = {e.lower() for e in cfg["doc_extensions"]}
+    out_exts = {e.lower() for e in cfg["output_extensions"]}
+
+    # 2. near-copies: run sprawl that never got a version suffix
+    near: list[dict] = []
+    if on("similar_files"):
+        candidates = [r for r in rest if PurePosixPath(r).suffix.lower() not in doc_exts | out_exts]
+        for g in similar_groups(root, candidates, cfg, deadline):
+            g["files"] = [file_info(root, rel, tracked) for rel in g["files"]]
+            near.append(g)
+            used.update(f["path"] for f in g["files"])
+
+    # 3. one-off scripts and 4. report files
+    oneoffs: list[dict] = []
+    reports: list[dict] = []
+    for rel in rels:
+        if rel in used:
+            continue
+        p = PurePosixPath(rel)
+        toks = tokens(p.stem)
+        if on("oneoff_scripts") and ((toks and toks[0] in cfg["oneoff_prefixes"]) or any(
+                re.search(pat, p.stem, re.IGNORECASE) for pat in cfg.get("oneoff_patterns", []))):
+            oneoffs.append(file_info(root, rel, tracked))
+        elif (on("report_files") and p.suffix.lower() in doc_exts and p.stem.lower() not in allowed
+              and any(t in cfg["report_keywords"] for t in toks)):
+            reports.append(file_info(root, rel, tracked))
+
+    return {
+        "root": str(root), "scope": scope_rel or ".", "scanned": len(rels), "complete": complete,
+        "git": tracked is not None, "protected_skipped": len(protected),
+        "versioned": versioned, "near_copies": near, "oneoffs": oneoffs, "reports": reports,
+    }
+
+
+def format_tidy(res: dict) -> str:
+    def desc(f: dict) -> str:
+        bits = []
+        if "lines" in f:
+            bits.append(f"{f['lines']} lines")
+        if "modified" in f:
+            bits.append(f"modified {f['modified']}")
+        if f.get("tracked") is False:
+            bits.append("untracked")
+        return f"{f['path']}  ({', '.join(bits)})" if bits else f["path"]
+
+    out = [f"Scanned {res['scanned']} files in '{res['scope']}' "
+           f"({'git repo' if res['git'] else 'not a git repo'})."]
+    if not res["complete"]:
+        out.append("Note: the scan stopped early (very large folder); run /tidy on a subfolder for full results.")
+    if res["protected_skipped"]:
+        out.append(f"{res['protected_skipped']} file(s) in protected paths were skipped and must not be changed.")
+    n = 0
+    if res["versioned"]:
+        out += ["", "Versioned copies and backups (merge into one file):"]
+        for g in res["versioned"]:
+            n += 1
+            head = f"'{g['original']}' <- " if g["original"] else "no unversioned original: "
+            out.append(f"  {n}. [{g['kind']}] {head}{', '.join(g['copies'])}")
+            out += [f"       {desc(f)}" for f in g["files"]]
+    if res["near_copies"]:
+        out += ["", "Near-copies in the same folder (fold the differences into one file as config or arguments):"]
+        for g in res["near_copies"]:
+            n += 1
+            out.append(f"  {n}. up to {g['similarity']}% identical:")
+            out += [f"       {desc(f)}" for f in g["files"]]
+    if res["oneoffs"]:
+        out += ["", "One-off scripts (delete, or move out of the project):"]
+        for f in res["oneoffs"]:
+            n += 1
+            out.append(f"  {n}. {desc(f)}")
+    if res["reports"]:
+        out += ["", "Report and summary files (delete, or fold what matters into README):"]
+        for f in res["reports"]:
+            n += 1
+            out.append(f"  {n}. {desc(f)}")
+    if n == 0:
+        out += ["", "No sprawl found."]
+    return "\n".join(out)
+
+
+def run_tidy(argv: list[str]) -> int:
+    try:
+        sys.stdout.reconfigure(errors="replace")  # non-ASCII file names on Windows consoles
+    except (AttributeError, ValueError):
+        pass
+    as_json = "--json" in argv
+    args = [a for a in argv if a != "--json"]
+    root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()).resolve()
+    scope = Path(args[0]).expanduser() if args else root
+    if not scope.is_absolute():
+        scope = Path.cwd() / scope
+    scope = scope.resolve()
+    if not is_within(scope, root):
+        root = scope
+    if not scope.is_dir():
+        print(f"Not a folder: {scope}")
+        return 0
+    res = tidy_scan(root, scope, load_config(root))
+    if as_json:
+        print(json.dumps(res, indent=2))
+    else:
+        print(format_tidy(res))
+    return 0
 
 
 HANDLERS = {
@@ -894,6 +1222,12 @@ def main() -> int:
     if event in ("--version", "-V"):
         print(f"{TAG} {VERSION}")
         return 0
+    if event == "tidy":  # command line, not a hook: prints a plain report for the /tidy command
+        try:
+            return run_tidy(sys.argv[2:])
+        except Exception as exc:
+            print(f"{TAG} tidy failed: {exc!r}")
+            return 0
     handler = HANDLERS.get(event)
     if handler is None:
         sys.stderr.write(f"{TAG}: unknown event '{event}'\n")

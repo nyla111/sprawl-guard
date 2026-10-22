@@ -417,7 +417,8 @@ class TurnCheck(Base):
         self.start()
         self.touch("made_by_claude.py")
         msg = self.stop()["systemMessage"]
-        self.assertIn("1 new file(s) this turn", msg)
+        self.assertTrue(msg.startswith("Files this turn: 1 created"), msg)
+        self.assertNotIn("sprawl-guard", msg)  # no tag: Claude Code labels the message itself
         self.assertNotIn("made_by_claude.py", msg)
         self.assertIsNone(self.stop())  # already reported
 
@@ -497,11 +498,76 @@ class TurnCheck(Base):
         self.assertIn("new_module.py", msg)
         self.assertNotIn("best.pt", msg)
 
+    def test_edits_and_deletions_counted(self):
+        self.touch("train.py", "a = 1\n")
+        self.touch("old.py", "b = 2\n")
+        self.touch("README.md", "readme\n")
+        self.start()
+        self.prompt("refactor")
+        self.touch("train.py", "a = 1\nb = 2\n")
+        (self.root / "old.py").unlink()
+        msg = self.stop()["systemMessage"]
+        self.assertEqual(msg, "Files this turn: 1 edited, 1 deleted")
+
+    def test_list_mode_names_each_kind(self):
+        self.config(turn_check="list", orphan_check=False)
+        self.touch("train.py", "a = 1\n")
+        self.touch("old.py", "b = 2\n")
+        self.prompt("go")
+        self.touch("train.py", "a = 10\n")
+        self.touch("model.py", "m = 1\n")
+        (self.root / "old.py").unlink()
+        msg = self.stop()["systemMessage"]
+        self.assertIn("1 created, 1 edited, 1 deleted", msg)
+        self.assertIn("(created: model.py; edited: train.py; deleted: old.py)", msg)
+
+    def test_changes_between_turns_not_counted(self):
+        self.touch("train.py", "a = 1\n")
+        self.start()
+        self.touch("train.py", "edited by you between turns\n")
+        self.touch("yours.py", "x\n")
+        self.prompt("next task")  # the turn starts here
+        self.assertIsNone(self.stop())
+
+    def test_unchanged_files_not_counted_as_edited(self):
+        self.touch("a.py", "x\n")
+        self.prompt("look at a.py")
+        (self.root / "a.py").read_text()
+        self.assertIsNone(self.stop())
+
+    def test_v03_snapshot_in_state_still_works(self):
+        self.touch("a.py", "x\n")
+        state_dir = Path(tempfile.gettempdir()) / "sprawl-guard"
+        state_dir.mkdir(exist_ok=True)
+        (state_dir / f"{self.session}.json").write_text(json.dumps({"snapshot": ["a.py"]}))
+        self.touch("a.py", "edited\n")  # no mtime in the old format: not an edit
+        self.touch("b.py", "x\n")
+        self.assertEqual(self.stop()["systemMessage"], "Files this turn: 1 created")
+        self.touch("a.py", "edited again\n")
+        self.assertEqual(self.stop()["systemMessage"], "Files this turn: 1 edited")
+
+    @unittest.skipUnless(HAS_GIT, "git not installed")
+    def test_tracked_files_edits_and_deletes_in_git_repo(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.touch("train.py", "a = 1\n")
+        self.touch("eval.py", "e = 1\n")
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        self.prompt("go")
+        self.touch("train.py", "a = 2\nb = 3\n")
+        (self.root / "eval.py").unlink()
+        self.assertEqual(self.stop()["systemMessage"], "Files this turn: 1 edited, 1 deleted")
+
+    def test_outputs_folder_edits_not_counted(self):
+        self.touch("outputs/run1/train.log", "1\n")
+        self.prompt("go")
+        self.touch("outputs/run1/train.log", "1\n2\n")
+        self.assertIsNone(self.stop())
+
     def test_missing_snapshot_starts_tracking(self):
         self.touch("a.py")
         self.assertIsNone(self.stop())
         self.touch("b.py")
-        self.assertIn("1 new file(s)", self.stop()["systemMessage"])
+        self.assertIn("1 created", self.stop()["systemMessage"])
 
 
 class Orphans(Base):
@@ -510,7 +576,7 @@ class Orphans(Base):
         self.touch("math_ops.py", "def add(a, b):\n    return a + b\n")
         self.touch("pipeline.py", "from math_ops import add\n")
         msg = self.stop()["systemMessage"]
-        self.assertIn("2 new file(s) this turn, 1 not referenced anywhere", msg)
+        self.assertIn("Files this turn: 2 created; 1 new file(s) not referenced anywhere", msg)
 
     def test_list_mode_names_orphans(self):
         self.config(turn_check="list")
@@ -519,6 +585,7 @@ class Orphans(Base):
         self.touch("pipeline.py", "import math_ops\n")
         msg = self.stop()["systemMessage"]
         self.assertIn("not referenced: pipeline.py", msg)
+        self.assertIn("created: math_ops.py, pipeline.py", msg)
 
     def test_mention_in_readme_counts_as_reference(self):
         self.touch("README.md", "Run `python evaluate.py` to evaluate.\n")
@@ -627,6 +694,122 @@ class Protected(Base):
         self.assertIsNone(self.write("data/raw/x.csv", tool="Read"))
 
 
+def tidy(root, *args, env=None):
+    e = {k: v for k, v in os.environ.items() if not k.startswith(("SPRAWL_GUARD", "CLAUDE_PROJECT_DIR"))}
+    e["SPRAWL_GUARD_HOME"] = HOME
+    e["CLAUDE_PROJECT_DIR"] = str(root)
+    e.update(env or {})
+    res = subprocess.run([sys.executable, str(SCRIPT), "tidy", *args], capture_output=True, env=e,
+                         cwd=str(root), timeout=60)
+    assert res.returncode == 0, res.stderr.decode()
+    return res.stdout.decode()
+
+
+class Tidy(Base):
+    def scan(self, *args):
+        return json.loads(tidy(self.root, *args, "--json"))
+
+    def test_versioned_group_with_original(self):
+        self.touch("train.py", "a\n")
+        self.touch("train_v2.py", "a\nb\n")
+        self.touch("train_final.py", "a\nc\n")
+        g = self.scan()["versioned"]
+        self.assertEqual(len(g), 1)
+        self.assertEqual(g[0]["original"], "train.py")
+        self.assertEqual(sorted(g[0]["copies"]), ["train_final.py", "train_v2.py"])
+        self.assertEqual(g[0]["kind"], "versioned")
+
+    def test_backup_group(self):
+        self.touch("src/model.py", "m\n")
+        self.touch("src/model_backup.py", "m\n")
+        g = self.scan()["versioned"][0]
+        self.assertEqual(g["kind"], "backup")
+        self.assertEqual(g["original"], "src/model.py")
+
+    def test_versions_without_original(self):
+        self.touch("model_v2.py", "a\n")
+        self.touch("model_v3.py", "b\n")
+        g = self.scan()["versioned"][0]
+        self.assertIsNone(g["original"])
+
+    def test_single_versioned_name_is_not_sprawl(self):
+        self.touch("resnet_v2.py", "a\n")
+        self.assertEqual(self.scan()["versioned"], [])
+
+    def test_different_folders_not_grouped(self):
+        self.touch("a/train.py", "a\n")
+        self.touch("b/train_v2.py", "a\n")
+        self.assertEqual(self.scan()["versioned"], [])
+
+    def test_near_copies(self):
+        self.touch("train.py", CODE)
+        self.touch("train_resnet.py", CODE.replace("print('train')", "print('resnet')"))
+        self.touch("other.py", "\n".join(f"v{i} = {i}" for i in range(20)))
+        g = self.scan()["near_copies"]
+        self.assertEqual(len(g), 1)
+        self.assertEqual([f["path"] for f in g[0]["files"]], ["train.py", "train_resnet.py"])
+
+    def test_oneoffs_and_reports(self):
+        self.touch("debug_loss.py", "x\n")
+        self.touch("IMPLEMENTATION_SUMMARY.md", "x\n")
+        self.touch("README.md", "x\n")
+        self.touch("src/model.py", "x\n")
+        res = self.scan()
+        self.assertEqual([f["path"] for f in res["oneoffs"]], ["debug_loss.py"])
+        self.assertEqual([f["path"] for f in res["reports"]], ["IMPLEMENTATION_SUMMARY.md"])
+
+    def test_skips_hidden_outputs_and_protected(self):
+        self.config(protected_paths=["data/raw"])
+        self.touch(".cache/debug_x.py", "x\n")
+        self.touch("outputs/run1/debug_x.py", "x\n")
+        self.touch("data/raw/debug_y.py", "x\n")
+        res = self.scan()
+        self.assertEqual(res["oneoffs"], [])
+        self.assertEqual(res["protected_skipped"], 1)
+
+    def test_rule_off_skips_kind(self):
+        self.config(oneoff_scripts="off", report_files="off")
+        self.touch("debug_loss.py", "x\n")
+        self.touch("SUMMARY.md", "x\n")
+        res = self.scan()
+        self.assertEqual((res["oneoffs"], res["reports"]), ([], []))
+
+    def test_folder_argument_limits_scope(self):
+        self.touch("a/debug_x.py", "x\n")
+        self.touch("b/debug_y.py", "x\n")
+        self.assertEqual([f["path"] for f in self.scan("a")["oneoffs"]], ["a/debug_x.py"])
+
+    def test_text_report(self):
+        self.touch("paper.tex", "a\n")
+        self.touch("paper_final.tex", "a\nb\n")
+        out = tidy(self.root)
+        self.assertIn("Versioned copies and backups", out)
+        self.assertIn("'paper.tex' <- paper_final.tex", out)
+        self.assertIn("2 lines", out)
+
+    def test_nothing_found(self):
+        self.touch("src/model.py", "x\n")
+        self.assertIn("No sprawl found.", tidy(self.root))
+
+    @unittest.skipUnless(HAS_GIT, "git not installed")
+    def test_untracked_marked_in_git_repo(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.touch("train.py", "a\n")
+        subprocess.run(["git", "-C", str(self.root), "add", "train.py"], check=True)
+        self.touch("train_v2.py", "a\n")
+        files = {f["path"]: f for f in self.scan()["versioned"][0]["files"]}
+        self.assertTrue(files["train.py"]["tracked"])
+        self.assertFalse(files["train_v2.py"]["tracked"])
+        self.assertIn("untracked", tidy(self.root))
+
+    def test_scan_never_changes_files(self):
+        self.touch("train.py", "a\n")
+        self.touch("train_v2.py", "b\n")
+        before = sorted(p.name for p in self.root.rglob("*"))
+        tidy(self.root)
+        self.assertEqual(before, sorted(p.name for p in self.root.rglob("*")))
+
+
 class Installer(unittest.TestCase):
     def test_install_and_uninstall_keep_other_settings(self):
         installer = Path(__file__).resolve().parent / "install.py"
@@ -646,6 +829,32 @@ class Installer(unittest.TestCase):
                            check=True, capture_output=True)
             data = json.loads(settings.read_text())
             self.assertEqual(data["hooks"], {"PreToolUse": [other]})
+
+    def test_tidy_skill_installed_and_removed(self):
+        installer = Path(__file__).resolve().parent / "install.py"
+        with tempfile.TemporaryDirectory() as proj:
+            subprocess.run([sys.executable, str(installer), "--project", proj], check=True, capture_output=True)
+            skill = Path(proj) / ".claude" / "skills" / "tidy" / "SKILL.md"
+            text = skill.read_text()
+            self.assertIn("name: tidy", text)
+            self.assertIn("sprawl_guard.py tidy $ARGUMENTS`", text)
+            self.assertIn("allowed-tools: Bash(", text)
+            subprocess.run([sys.executable, str(installer), "--project", proj, "--uninstall"],
+                           check=True, capture_output=True)
+            self.assertFalse(skill.exists())
+
+    def test_existing_foreign_tidy_skill_left_alone(self):
+        installer = Path(__file__).resolve().parent / "install.py"
+        with tempfile.TemporaryDirectory() as proj:
+            skill = Path(proj) / ".claude" / "skills" / "tidy" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("my own tidy")
+            out = subprocess.run([sys.executable, str(installer), "--project", proj], check=True,
+                                 capture_output=True).stdout.decode()
+            self.assertIn("Skipped /tidy", out)
+            subprocess.run([sys.executable, str(installer), "--project", proj, "--uninstall"],
+                           check=True, capture_output=True)
+            self.assertEqual(skill.read_text(), "my own tidy")
 
 
 if __name__ == "__main__":

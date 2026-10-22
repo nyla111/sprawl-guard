@@ -71,22 +71,46 @@ and similar folders.
 
 ## End-of-turn check (`turn_check`)
 
-When Claude finishes a turn, sprawl-guard compares the project with the snapshot from before
-the turn. This also catches files created through shell commands, which the write check cannot
-see. It runs after Claude has finished and only shows you a message, so it never interrupts
-work. Hidden folders (`.gemini`, `.cache`, ...), ignored folders and the outputs folder are
-skipped.
+When Claude finishes a turn, sprawl-guard compares the project with a snapshot taken when you
+sent your prompt, and counts the files created, edited and deleted during the turn. This also
+catches changes made through shell commands, which the write check cannot see. Changes you make
+yourself between turns are not counted. It runs after Claude has finished and only shows you a
+message, so it never interrupts work. Hidden folders (`.gemini`, `.cache`, ...), ignored folders
+and the outputs folder are skipped.
 
 | Mode | What you see |
 |---|---|
-| `summary` (default) | One line: `[sprawl-guard] 3 new file(s) this turn, 1 not referenced anywhere` |
-| `list` | The same, plus file names (up to 10) |
+| `summary` (default) | One line: `Files this turn: 3 created, 2 edited, 1 deleted; 1 new file(s) not referenced anywhere` |
+| `list` | The same, plus file names for each kind (up to 10 each) |
 | `force` | Claude must merge or delete new files before it can finish (once per turn; off while unattended) |
 | `off` | Nothing |
+
+Claude Code shows the line with its own label in front (`Stop says: ...`), so sprawl-guard adds
+no tag of its own. In a very large folder (over 50,000 files, or a scan longer than 3 seconds)
+the counts are skipped for that turn rather than reported wrong.
 
 "Not referenced anywhere" is the orphan check: new code files whose name appears in no other
 file of the project, which are often dead code. Test files are skipped, and a mention in the
 README counts as a reference. Turn it off with `"orphan_check": false`.
+
+## Clean up existing sprawl (`/tidy`)
+
+The rules above stop new sprawl. For sprawl already in a project, type `/tidy` in Claude Code
+(or `/tidy src` for one folder). sprawl-guard scans the project and lists:
+
+- versioned copies and backups next to their original (`train.py` <- `train_v2.py`, `train_final.py`),
+- near-copies in the same folder (`train.py` ~ `train_resnet.py`, 87% identical),
+- one-off scripts (`debug_*`, `tmp_*`, ...),
+- report files (`IMPLEMENTATION_SUMMARY.md`, ...).
+
+Claude then goes through the groups with you, compares the files and proposes a merge, and asks
+before every change. Before it changes a group it commits a local git checkpoint of just those
+files (never pushes); outside git it moves removed files to the scratchpad instead of deleting
+them. It updates imports and references to merged files and creates no new files. Protected
+paths and rules you set to `off` are left out of the scan.
+
+The scan alone, without Claude: `python3 sprawl_guard.py tidy [folder]` from the project folder
+(add `--json` for machine-readable output). It never changes files.
 
 **Context.** No per-prompt reminder. The rules are restated only after compaction
 (about 45 tokens) and inside each block message. Set `"reminder": "always"` to restate them
@@ -140,7 +164,7 @@ git pull
 ```
 
 Script changes apply from the next Claude Code session. Run `install.py` again when
-[CHANGELOG.md](CHANGELOG.md) says so for that release (v0.3 does).
+[CHANGELOG.md](CHANGELOG.md) says so for that release (v0.3 and v0.4 do).
 
 ## Configure
 
@@ -162,8 +186,8 @@ see the top of `sprawl_guard.py`.
 
 | File | Purpose |
 |---|---|
-| `sprawl_guard.py` | The guard: one script that handles all four hook events |
-| `install.py` | Adds or removes the hooks in a Claude Code settings file |
+| `sprawl_guard.py` | The guard: one script that handles all four hook events and the `/tidy` scan |
+| `install.py` | Adds or removes the hooks and the `/tidy` command |
 | `sprawl-guard.example.json` | Example config with the main options and their defaults |
 | `test_sprawl_guard.py` | Test suite (feeds the script real hook JSON in temporary folders) |
 | `CHANGELOG.md` | What changed in each release, and when to re-run the installer |
@@ -179,6 +203,8 @@ Set `SPRAWL_GUARD_DEBUG=1` to print each decision to the hook debug log.
 ## Known limits
 
 - Files created through shell commands are not blocked, only counted at the end of the turn.
+- Edits are detected from file modification times, so a tool that rewrites a file with the
+  same content still counts as an edit.
   Protected paths are enforced for Claude's file tools, not for shell commands.
 - Detection is name- and content-based heuristics. Unattended and "new version" detection use
   keyword lists; adjust them in the config if they misfire.
