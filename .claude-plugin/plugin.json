@@ -1,0 +1,10 @@
+{
+  "name": "sprawl-guard",
+  "version": "0.5.0",
+  "description": "Hooks that stop Claude Code from cluttering your project with _v2 copies, backups, one-off scripts and report files, plus a prose check for the docs it writes.",
+  "author": { "name": "nyla111", "url": "https://github.com/nyla111" },
+  "homepage": "https://github.com/nyla111/sprawl-guard",
+  "repository": "https://github.com/nyla111/sprawl-guard",
+  "license": "MIT",
+  "keywords": ["hooks", "workspace", "file-sprawl", "research", "prose"]
+}

@@ -1,212 +1,138 @@
 # sprawl-guard
 
-Stops Claude Code from cluttering your workspace with `train_v2.py`, `train_resnet.py`,
-`paper_final.tex`, `IMPLEMENTATION_SUMMARY.md`, `utils2.py`, stray `results.csv` files and
-throwaway `debug_*.py` scripts.
+Claude Code hooks that keep your project free of `train_v2.py`, `paper_final.tex`,
+`IMPLEMENTATION_SUMMARY.md`, `utils2.py`, stray `results.csv` files and throwaway `debug_*.py`
+scripts.
 
-Rules in CLAUDE.md fade in long sessions and after compaction. sprawl-guard uses Claude Code
-**hooks**, so the checks run on every new file, however deep the session is. The checks run
-locally and cost no tokens; Claude only sees a short message when a rule fires.
+Rules in CLAUDE.md fade in long sessions and after compaction. Hooks run on every file write,
+however deep the session is. The checks run locally, cost no tokens, and make no network calls.
 
-## How it decides
+## What it does
 
-Every rule has a mode:
-
-| Mode | What happens |
-|---|---|
-| `deny` | Blocked. Claude fixes it itself: merges into the original, renames, or uses the scratchpad. |
-| `confirm` | Blocked, and Claude must ask you with options. If you choose "create anyway", the retry gets a one-time permission prompt. |
-| `ask` | A normal Claude Code permission prompt. |
-| `warn` | Allowed. Claude gets a one-line note. |
-| `off` | Rule disabled. |
-
-**If you named the file in your prompt** (or asked for "a new version", "a separate file",
-"keep the original"...), rules that would `deny` become `confirm`: you get asked instead of
-Claude silently doing something else. Backups and protected paths are the exceptions and are
-always denied.
-
-**Unattended mode.** Say it in your prompt ("work autonomously", "I'll be away", "overnight",
-"don't ask me", "until done", or the tag `#unattended`), or set the environment variable
-`SPRAWL_GUARD_UNATTENDED=1`. While on, `confirm` and `ask` never interrupt: the file is allowed
-and logged to `~/.claude/sprawl-guard.log`, and the end-of-turn summary counts it. `deny` rules
-still apply because Claude can fix those without you, and `force` mode of the turn check is
-switched off. It switches off with your next normal prompt.
-
-## Rules for new files
-
-| Rule | Example | Default |
-|---|---|---|
-| `versioned_files` | `train_v2.py` when `train.py` exists | `deny`: merge into `train.py`, remove superseded parts |
-| `backup_files` | `train_backup.py`, `paper (1).tex` | `deny`, even if named |
-| `versioned_no_base` | `resnet_v2.py` with no `resnet.py` | `warn` (often a real model name) |
-| `similar_files` | new file 60%+ identical to an existing one | `deny`: add a config entry or argument instead |
-| `sibling_names` | `train_resnet.py` next to `train.py`, different content | `warn` |
-| `report_files` | `SUMMARY.md`, `final_report.txt`, `ChangesSummary.md` | `confirm` |
-| `other_docs` | `design.md` | `warn` |
-| `oneoff_scripts` | `debug_*`, `tmp_*`, `scratch*`, `quick_test*` | `deny`: use the session scratchpad |
-| `long_names` | over 30 characters or more than 3 `_`/`-`/`.` separators | `deny`: rename shorter |
-| `generic_names` | `utils2`, `misc`, `helper_new`, `main2`, dates in names | `deny` |
-| `outputs_files` | `model.pt`, `train.log`, `results.csv`, `eval_metrics.json` outside `outputs/` | `warn`: save under `outputs/<run>/` |
-| `root_files` | new `helpers.py` at the project root when `src/` already holds code | `off` (turn on with `warn` or `deny`) |
-| `file_budget` | more than 10 new files in one session | `ask` |
-
-**Outputs folder.** Run outputs (logs, checkpoints, results files) belong in one folder,
-`outputs/<run>/` by default, which you keep in `.gitignore`. No rules apply inside it, and it is
-left out of the end-of-turn summary. Change the name with `"outputs_dir"`.
-
-**Protected paths.** Folders Claude must never write into, such as raw data or finished
-results: `"protected_paths": ["data/raw/**", "results/final"]`. A plain folder name covers
-everything below it. This blocks creating, editing and overwriting files there, also when you
-name the file or run unattended. Remove the entry from the config if you really need a change.
-
-**Git checkpoint.** Before Claude merges into an original file, sprawl-guard makes a local
-commit of just that file (`sprawl-guard: checkpoint train.py before in-place edit`), so the old
-version stays recoverable. It never pushes, never commits other staged files, and skips
-during a merge or rebase. Turn off with `"git_checkpoint": false`.
-
-**Always allowed:** editing existing files (except in protected paths); standard repo files
-(README, LICENSE, CHANGELOG, CLAUDE.md, AGENTS.md, requirements.txt, ...); anything outside the
-project, in the scratchpad, or in `.git`, `.claude`, `node_modules`, `venv`, `build`, `wandb`
-and similar folders.
-
-## End-of-turn check (`turn_check`)
-
-When Claude finishes a turn, sprawl-guard compares the project with a snapshot taken when you
-sent your prompt, and counts the files created, edited and deleted during the turn. This also
-catches changes made through shell commands, which the write check cannot see. Changes you make
-yourself between turns are not counted. It runs after Claude has finished and only shows you a
-message, so it never interrupts work. Hidden folders (`.gemini`, `.cache`, ...), ignored folders
-and the outputs folder are skipped.
-
-| Mode | What you see |
-|---|---|
-| `summary` (default) | One line: `Files this turn: 3 created, 2 edited, 1 deleted; 1 new file(s) not referenced anywhere` |
-| `list` | The same, plus file names for each kind (up to 10 each) |
-| `force` | Claude must merge or delete new files before it can finish (once per turn; off while unattended) |
-| `off` | Nothing |
-
-Claude Code shows the line with its own label in front (`Stop says: ...`), so sprawl-guard adds
-no tag of its own. In a very large folder (over 50,000 files, or a scan longer than 3 seconds)
-the counts are skipped for that turn rather than reported wrong.
-
-"Not referenced anywhere" is the orphan check: new code files whose name appears in no other
-file of the project, which are often dead code. Test files are skipped, and a mention in the
-README counts as a reference. Turn it off with `"orphan_check": false`.
-
-## Clean up existing sprawl (`/tidy`)
-
-The rules above stop new sprawl. For sprawl already in a project, type `/tidy` in Claude Code
-(or `/tidy src` for one folder). sprawl-guard scans the project and lists:
-
-- versioned copies and backups next to their original (`train.py` <- `train_v2.py`, `train_final.py`),
-- near-copies in the same folder (`train.py` ~ `train_resnet.py`, 87% identical),
-- one-off scripts (`debug_*`, `tmp_*`, ...),
-- report files (`IMPLEMENTATION_SUMMARY.md`, ...).
-
-Claude then goes through the groups with you, compares the files and proposes a merge, and asks
-before every change. Before it changes a group it commits a local git checkpoint of just those
-files (never pushes); outside git it moves removed files to the scratchpad instead of deleting
-them. It updates imports and references to merged files and creates no new files. Protected
-paths and rules you set to `off` are left out of the scan.
-
-The scan alone, without Claude: `python3 sprawl_guard.py tidy [folder]` from the project folder
-(add `--json` for machine-readable output). It never changes files.
-
-**Context.** No per-prompt reminder. The rules are restated only after compaction
-(about 45 tokens) and inside each block message. Set `"reminder": "always"` to restate them
-on every prompt, or `"off"`.
+- Checks every new file before it is written, and blocks or redirects versioned copies, backups,
+  near-duplicates, one-off scripts, report files and badly named files.
+- Gives Claude the workspace rules and a list of existing files at every session start, and the
+  same rules to subagents.
+- Counts the files created, edited and deleted at the end of each turn, including changes made
+  through shell commands.
+- Checks the docs Claude writes for wording that reads as machine-written (em dashes,
+  "not X, but Y" frames, stock phrases) and asks it to rewrite those spots.
+- `/tidy` cleans up sprawl that already exists, with your approval for every change.
 
 ## Install
 
-Requires Python 3.8+ and git. No other dependencies. Same steps on Windows, macOS and Linux.
-Install it on every machine where you run Claude Code (laptop, server, ...), because hooks run
-locally on the machine where Claude Code runs.
+Requires Python 3.8+ and git. Install on every machine where you run Claude Code.
 
-1. Clone it to a permanent location. The hooks point to this folder, so do not leave it in a
-   temporary or downloads folder.
+**Plugin** (recommended). In Claude Code:
 
-   ```bash
-   git clone https://github.com/nyla111/sprawl-guard.git ~/tools/sprawl-guard
-   cd ~/tools/sprawl-guard
-   ```
-
-   On Windows PowerShell, use for example `git clone https://github.com/nyla111/sprawl-guard.git D:\tools\sprawl-guard`.
-
-2. Optional but recommended: run the tests.
-
-   ```bash
-   python3 -m unittest test_sprawl_guard
-   ```
-
-3. Install the hooks.
-
-   ```bash
-   python3 install.py                          # all your projects
-   python3 install.py --project /path/to/repo  # one project only
-   ```
-
-   Use `python` instead of `python3` on Windows. The installer records the exact Python you ran
-   it with, so run it with the interpreter you want the hooks to use.
-
-4. **Restart Claude Code** (`/exit`, then `claude`) and run `/hooks` to check the hooks
-   are listed. If the list is empty, you started Claude Code in a different folder than the one
-   you installed into (project installs apply only to that folder).
-
-The installer keeps your existing settings, writes a `.sprawl-guard.bak` backup first, and
-never touches hooks it did not create. Re-running it is safe and replaces the old entries.
-If you move the folder, run the installer again.
-
-## Update
-
-```bash
-cd ~/tools/sprawl-guard
-git pull
+```
+/plugin install sprawl-guard --marketplace nyla111/sprawl-guard
 ```
 
-Script changes apply from the next Claude Code session. Run `install.py` again when
-[CHANGELOG.md](CHANGELOG.md) says so for that release (v0.3 and v0.4 do).
+On Claude Code before 2.1.275, run `/plugin marketplace add nyla111/sprawl-guard`, then
+`/plugin install sprawl-guard@sprawl-guard`. Restart Claude Code afterwards. On Windows the
+plugin needs Git Bash; without it, use the manual install.
 
-## Configure
+**Manual.** Clone to a permanent folder and run the installer:
 
-Copy `sprawl-guard.example.json` to `~/.claude/sprawl-guard.json` (all projects) or
-`<project>/.claude/sprawl-guard.json` (one project, overrides the global file), and keep only
-the keys you want to change. `allow_paths` takes globs that are always allowed, e.g.
-`["docs/**"]`. Word and extension lists (`report_keywords`, `version_suffixes`,
-`backup_suffixes`, `oneoff_prefixes`, `generic_patterns`, `output_extensions`,
-`output_keywords`, `request_keywords`, `unattended_keywords`, ...) can be replaced the same way;
-see the top of `sprawl_guard.py`.
+```bash
+git clone https://github.com/nyla111/sprawl-guard.git ~/tools/sprawl-guard
+cd ~/tools/sprawl-guard
+python3 install.py                          # all projects
+python3 install.py --project /path/to/repo  # one project
+```
+
+Use `python` on Windows. The installer keeps your existing settings and writes a backup first.
+Restart Claude Code and run `/hooks` to confirm.
+
+Use one install method, not both.
+
+## Commands
+
+| Command | Plugin name | What it does |
+|---|---|---|
+| `/tidy [folder]` | `/sprawl-guard:tidy` | Lists existing sprawl and merges or removes it with you, one group at a time, after a local git checkpoint |
+| `/sprawl [profile] [--global]` | `/sprawl-guard:sprawl` | Shows or sets the profile: `relaxed`, `default`, `strict` or `off` |
+
+From a terminal: `python3 sprawl_guard.py tidy`, `profile` or `prose FILE...`. The `prose`
+command exits with 1 when it finds something, so it works in CI.
+
+## Rules for new files
+
+Each rule has a mode: `deny` (blocked; Claude fixes it itself), `confirm` (blocked; Claude asks
+you), `ask` (permission prompt), `warn` (allowed with a note) or `off`.
+
+| Rule | Example | Default |
+|---|---|---|
+| `versioned_files` | `train_v2.py` next to `train.py` | `deny`: merge into `train.py` |
+| `backup_files` | `train_backup.py`, `paper (1).tex` | `deny` |
+| `versioned_no_base` | `resnet_v2.py` with no `resnet.py` | `warn` |
+| `similar_files` | new file 60%+ identical to an existing one | `deny`: use a config entry or argument |
+| `sibling_names` | `train_resnet.py` next to `train.py` | `warn` |
+| `report_files` | `SUMMARY.md`, `final_report.txt` | `confirm` |
+| `other_docs` | `design.md` | `warn` |
+| `oneoff_scripts` | `debug_*`, `tmp_*`, `scratch*` | `deny`: use the session scratchpad |
+| `long_names` | over 30 characters or 3 separators | `deny` |
+| `generic_names` | `utils2`, `misc`, dates in names | `deny` |
+| `outputs_files` | `model.pt`, `train.log` outside `outputs/` | `warn`: save under `outputs/<run>/` |
+| `root_files` | new code at the root when `src/` exists | `off` |
+| `file_budget` | more than 10 new files in a session | `ask` |
+
+If you name the file in your prompt or ask for "a new version" or "a separate file", `deny`
+becomes `confirm`, so you decide. Backups and protected paths stay denied.
+
+Editing existing files outside protected paths is always allowed, as are standard repo files (README, LICENSE,
+CHANGELOG, CLAUDE.md, ...) and anything in the scratchpad, `.git`, `node_modules`, `venv` and
+similar folders. Nothing is checked inside the outputs folder.
+
+## Configuration
+
+Put the keys you want to change in `~/.claude/sprawl-guard.json` (all projects) or
+`<project>/.claude/sprawl-guard.json` (one project, takes precedence).
+[`sprawl-guard.example.json`](sprawl-guard.example.json) lists the main options; all of them,
+including the word lists, are at the top of `sprawl_guard.py`.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `profile` | `default` | `relaxed` turns most denies into warnings; `strict` tightens rules and the prose check. Your own keys override it |
+| `protected_paths` | `[]` | Never created, edited or overwritten, e.g. `["data/raw/**", "results/final"]` |
+| `outputs_dir` | `outputs` | Where logs, checkpoints and results belong |
+| `allow_paths` | `[]` | Globs that are always allowed, e.g. `["docs/**"]` |
+| `git_checkpoint` | `true` | Commit the original locally before Claude merges into it (never pushes) |
+| `turn_check` | `summary` | End-of-turn message: `summary`, `list` (with file names), `force` (Claude must clean up first) or `off` |
+| `reminder` | `session` | When Claude gets the rules: every session start, only after `compact`, `always`, or `off` |
+| `file_index` | `true` | List existing files at session start (folder counts above 300 files) |
+| `prose` | `warn` | Prose check: `warn`, `strict` or `off` |
+| `prose_allow` | `[]` | Words never flagged, e.g. `["seamless"]` |
+
+**Unattended runs.** Write "work autonomously", "overnight" or `#unattended` in your prompt, or
+set `SPRAWL_GUARD_UNATTENDED=1`. `confirm` and `ask` then allow the file and log it to
+`~/.claude/sprawl-guard.log` instead of waiting for you. `deny` still applies.
+
+**Prose check.** Scans only the text Claude just wrote into `.md`, `.rst` or `.txt` files.
+Code, quotes, links and front matter are skipped, and field terms such as "robust" are not
+flagged. It removes common surface patterns; it does not make text undetectable.
 
 ## Turn it off
 
 - One session: start Claude Code with `SPRAWL_GUARD=off`.
-- One project: `{"enabled": false}` in `<project>/.claude/sprawl-guard.json`.
-- Completely: `python install.py --uninstall` (add `--project PATH` if installed per project).
+- One project: `/sprawl off`.
+- Uninstall: `/plugin uninstall sprawl-guard`, or `python3 install.py --uninstall`.
 
-## Repository layout
+## Limits
 
-| File | Purpose |
-|---|---|
-| `sprawl_guard.py` | The guard: one script that handles all four hook events and the `/tidy` scan |
-| `install.py` | Adds or removes the hooks and the `/tidy` command |
-| `sprawl-guard.example.json` | Example config with the main options and their defaults |
-| `test_sprawl_guard.py` | Test suite (feeds the script real hook JSON in temporary folders) |
-| `CHANGELOG.md` | What changed in each release, and when to re-run the installer |
+- Files created through shell commands are counted at the end of the turn, not blocked.
+  Protected paths cover Claude's file tools only.
+- Detection uses name, content and keyword heuristics. Adjust the word lists if they misfire.
+- The prose check is a fixed pattern list and does not check chat replies.
 
-## Test
+## Development
 
-```bash
-python -m unittest test_sprawl_guard -v
-```
+Run the tests with `python3 -m unittest test_sprawl_guard`. The plugin files in `hooks/` and
+`skills/` are generated with `python3 install.py --build-plugin`, and a test fails if they are
+out of date. Set `SPRAWL_GUARD_DEBUG=1` to log each decision. See [CHANGELOG.md](CHANGELOG.md)
+for release notes, including when to re-run the installer.
 
-Set `SPRAWL_GUARD_DEBUG=1` to print each decision to the hook debug log.
+## License
 
-## Known limits
-
-- Files created through shell commands are not blocked, only counted at the end of the turn.
-- Edits are detected from file modification times, so a tool that rewrites a file with the
-  same content still counts as an edit.
-  Protected paths are enforced for Claude's file tools, not for shell commands.
-- Detection is name- and content-based heuristics. Unattended and "new version" detection use
-  keyword lists; adjust them in the config if they misfire.
-- Whether the one-time `ask` prompt appears in auto mode depends on Claude Code's permission
-  handling; if it is auto-approved, the retry simply goes through.
+[MIT](LICENSE)

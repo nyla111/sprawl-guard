@@ -391,11 +391,34 @@ class Context(Base):
     def test_prompt_is_silent_by_default(self):
         self.assertIsNone(self.prompt("hi"))
 
-    def test_reminder_after_compaction(self):
-        base = {"session_id": self.session, "cwd": str(self.root)}
-        self.assertIsNone(run("session-start", {**base, "source": "startup"}))
-        out = run("session-start", {**base, "source": "compact"})
+    def session_start(self, source):
+        out = run("session-start", {"session_id": self.session, "cwd": str(self.root), "source": source})
+        return out["hookSpecificOutput"]["additionalContext"] if out else None
+
+    def test_rules_at_every_session_start_by_default(self):
+        for source in ("startup", "resume", "clear", "compact"):
+            self.assertIn("Workspace rules", self.session_start(source), source)
+
+    def test_compact_mode_only_after_compaction(self):
+        self.config(reminder="compact", file_index=False)
+        self.assertIsNone(self.session_start("startup"))
+        self.assertIn("Workspace rules", self.session_start("compact"))
+
+    def test_prose_line_follows_prose_setting(self):
+        self.assertIn("no em dashes", self.session_start("startup"))
+        self.config(prose="off")
+        self.assertNotIn("no em dashes", self.session_start("startup"))
+
+    def test_subagents_get_the_rules(self):
+        out = run("subagent-start", {"session_id": self.session, "cwd": str(self.root), "agent_type": "Explore"})
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SubagentStart")
         self.assertIn("Workspace rules", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_subagent_rules_can_be_turned_off(self):
+        self.config(subagent_rules=False)
+        self.assertIsNone(run("subagent-start", {"session_id": self.session, "cwd": str(self.root)}))
+        self.config(reminder="off")
+        self.assertIsNone(run("subagent-start", {"session_id": self.session, "cwd": str(self.root)}))
 
     def test_reminder_always_mode(self):
         self.config(reminder="always")
@@ -409,6 +432,174 @@ class Context(Base):
     def test_v01_boolean_config_still_works(self):
         self.config(reminder=True)
         self.assertIsNone(self.prompt("hi"))
+
+
+class FileIndex(Base):
+    def context(self, source="startup"):
+        out = run("session-start", {"session_id": self.session, "cwd": str(self.root), "source": source})
+        return out["hookSpecificOutput"]["additionalContext"] if out else ""
+
+    def test_lists_files_by_folder(self):
+        self.touch("train.py")
+        self.touch("src/model.py")
+        self.touch("src/data.py")
+        self.touch(".hidden/secret.py")
+        self.touch("outputs/run1/train.log")
+        ctx = self.context()
+        self.assertIn("./: train.py", ctx)
+        self.assertIn("src/: data.py, model.py", ctx)
+        self.assertNotIn("secret.py", ctx)
+        self.assertNotIn("train.log", ctx)
+
+    def test_not_repeated_on_resume(self):
+        self.touch("train.py")
+        self.context("startup")
+        self.assertNotIn("train.py", self.context("resume"))
+        self.assertIn("train.py", self.context("compact"))
+
+    def test_big_project_gets_folder_counts(self):
+        self.config(file_index_max_files=5)
+        for i in range(8):
+            self.touch(f"src/m{i}.py")
+        ctx = self.context()
+        self.assertIn("src/ (8)", ctx)
+        self.assertNotIn("m3.py", ctx)
+
+    def test_can_be_turned_off(self):
+        self.config(file_index=False)
+        self.touch("train.py")
+        self.assertNotIn("train.py", self.context())
+
+
+class Profiles(Base):
+    def cli(self, *args, home=None):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("SPRAWL_GUARD", "CLAUDE_PROJECT_DIR"))}
+        env["SPRAWL_GUARD_HOME"] = home or HOME
+        env["CLAUDE_PROJECT_DIR"] = str(self.root)
+        res = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, env=env, timeout=60)
+        return res.returncode, res.stdout.decode()
+
+    def test_relaxed_turns_denies_into_warnings(self):
+        self.config(profile="relaxed")
+        self.touch("train.py")
+        self.assertEqual(self.decision(self.write("train_v2.py")), "warn")
+
+    def test_strict_tightens(self):
+        self.config(profile="strict")
+        self.assertEqual(self.decision(self.write("design.md")), "confirm")
+        self.assertEqual(self.decision(self.write("model.pt")), "deny")
+
+    def test_own_keys_override_profile(self):
+        self.config(profile="relaxed", versioned_files="deny")
+        self.touch("train.py")
+        self.assertEqual(self.decision(self.write("train_v2.py")), "deny")
+
+    def test_off_profile_disables(self):
+        self.config(profile="off")
+        self.touch("train.py")
+        self.assertIsNone(self.write("train_v2.py"))
+
+    def test_cli_sets_and_shows_profile(self):
+        self.config(file_budget=3)
+        _, out = self.cli("profile", "strict")
+        self.assertIn("Profile set to 'strict'", out)
+        saved = json.loads((self.root / ".claude" / "sprawl-guard.json").read_text())
+        self.assertEqual(saved, {"file_budget": 3, "profile": "strict"})  # other keys kept
+        self.assertIn("override the profile: file_budget", out)
+        _, out = self.cli("profile")
+        self.assertIn("Profile: strict", out)
+        self.assertIn("prose=strict", out)
+
+    def test_cli_global_and_unknown(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.cli("profile", "relaxed", "--global", home=home)
+            self.assertEqual(json.loads((Path(home) / "sprawl-guard.json").read_text())["profile"], "relaxed")
+        _, out = self.cli("profile", "maximum")
+        self.assertIn("Unknown profile", out)
+
+
+class Prose(Base):
+    TEXT = "# Setup\n\nThis tool is seamless — it just works.\n"
+
+    def post(self, rel, content=None, tool="Write", **tool_input):
+        if content is not None:
+            tool_input["content"] = content
+        payload = {"session_id": self.session, "cwd": str(self.root), "hook_event_name": "PostToolUse",
+                   "tool_name": tool, "tool_input": {"file_path": str(self.root / rel), **tool_input}}
+        out = run("post-write", payload)
+        return out["hookSpecificOutput"]["additionalContext"] if out else None
+
+    def scan(self, text, **cfg):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import sprawl_guard
+        conf = dict(sprawl_guard.DEFAULT_CONFIG, **cfg)
+        return [(f["kind"], f["match"]) for f in sprawl_guard.prose_scan(text, conf)]
+
+    def test_write_to_doc_is_checked(self):
+        msg = self.post("README.md", self.TEXT)
+        self.assertIn("line 3: '—' (em dash)", msg)
+        self.assertIn("'seamless' (stock phrase)", msg)
+
+    def test_code_files_and_other_places_skipped(self):
+        self.assertIsNone(self.post("train.py", self.TEXT))
+        self.assertIsNone(self.post("LICENSE.txt", self.TEXT))
+        self.assertIsNone(self.post("outputs/run/notes.md", self.TEXT))
+        self.assertIsNone(self.post(".claude/notes.md", self.TEXT))
+        self.config(prose_skip_paths=["docs/**"])
+        self.assertIsNone(self.post("docs/a.md", self.TEXT))
+
+    def test_off(self):
+        self.config(prose="off")
+        self.assertIsNone(self.post("README.md", self.TEXT))
+
+    def test_edit_checks_only_new_text_with_file_line_numbers(self):
+        self.touch("README.md", "# Title\n\nOld seamless text by the user.\n\nNew part — here.\n")
+        msg = self.post("README.md", tool="Edit", old_string="x", new_string="New part — here.")
+        self.assertIn("line 5:", msg)
+        self.assertNotIn("seamless", msg)
+
+    def test_multiedit(self):
+        self.touch("notes.md", "a\nLet's dive in.\n")
+        msg = self.post("notes.md", tool="MultiEdit", edits=[{"old_string": "x", "new_string": "Let's dive in."}])
+        self.assertIn("line 2:", msg)
+
+    def test_patterns(self):
+        cases = {
+            "This isn't just a tool, it's a habit.": "contrast frame",
+            "It's not about speed. It's about trust.": "contrast frame",
+            "Not a bug, but a feature.": "contrast frame",
+            "The result? Fewer files.": "self-answered question",
+            "Hope this helps!": "closing pleasantry",
+            "It could potentially fail.": "stacked hedge",
+            "- \U0001F680 Fast install": "emoji",
+            "Values range 1 -- 5.": "em dash",
+        }
+        for text, kind in cases.items():
+            self.assertIn(kind, [k for k, _ in self.scan(text)], text)
+
+    def test_near_misses(self):
+        for text in ("Does it need a config file? No.", "Use the test harness.", "It is not ready yet.",
+                     "A robust model under shift.", "Pages 1-5 and 2026-11-08.", "Rated 4–5 stars."):
+            self.assertEqual(self.scan(text), [], text)
+
+    def test_code_quotes_links_front_matter_skipped(self):
+        text = ("---\ntitle: seamless\n---\nUse `delve` here.\n```\nseamless\n```\n> seamless quote\n"
+                "[link](https://x.com/seamless) and <!-- seamless -->\n")
+        self.assertEqual(self.scan(text), [])
+
+    def test_strict_extras_and_allow_list(self):
+        self.assertEqual(self.scan("A crucial step."), [])
+        self.assertIn(("stock phrase", "crucial"), self.scan("A crucial step.", prose="strict"))
+        self.assertIn("title case heading", [k for k, _ in self.scan("## Getting Started With Profiles", prose="strict")])
+        self.assertEqual(self.scan("A seamless step.", prose_allow=["seamless"]), [])
+        self.assertIn(("stock phrase", "blazing"), self.scan("blazing fast", prose_words_extra=["blazing"]))
+
+    def test_cli(self):
+        self.touch("a.md", self.TEXT)
+        res = subprocess.run([sys.executable, str(SCRIPT), "prose", str(self.root / "a.md")],
+                             capture_output=True, env={**os.environ, "SPRAWL_GUARD_HOME": HOME}, timeout=60)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("2 finding(s)", res.stdout.decode())
 
 
 class TurnCheck(Base):
@@ -823,14 +1014,15 @@ class Installer(unittest.TestCase):
             data = json.loads(settings.read_text())
             self.assertEqual(data["model"], "x")
             self.assertEqual(len(data["hooks"]["PreToolUse"]), 2)
-            self.assertEqual(set(data["hooks"]), {"PreToolUse", "UserPromptSubmit", "SessionStart", "Stop"})
+            self.assertEqual(set(data["hooks"]), {"PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart",
+                                                  "SubagentStart", "Stop"})
             self.assertEqual(data["hooks"]["PreToolUse"][1]["matcher"], "Write|Edit|MultiEdit|NotebookEdit")
             subprocess.run([sys.executable, str(installer), "--project", proj, "--uninstall"],
                            check=True, capture_output=True)
             data = json.loads(settings.read_text())
             self.assertEqual(data["hooks"], {"PreToolUse": [other]})
 
-    def test_tidy_skill_installed_and_removed(self):
+    def test_skills_installed_and_removed(self):
         installer = Path(__file__).resolve().parent / "install.py"
         with tempfile.TemporaryDirectory() as proj:
             subprocess.run([sys.executable, str(installer), "--project", proj], check=True, capture_output=True)
@@ -838,10 +1030,13 @@ class Installer(unittest.TestCase):
             text = skill.read_text()
             self.assertIn("name: tidy", text)
             self.assertIn("sprawl_guard.py tidy $ARGUMENTS`", text)
-            self.assertIn("allowed-tools: Bash(", text)
+            self.assertIn("allowed-tools:\n  - Bash(", text)
+            profile = Path(proj) / ".claude" / "skills" / "sprawl" / "SKILL.md"
+            self.assertIn("sprawl_guard.py profile $ARGUMENTS`", profile.read_text())
             subprocess.run([sys.executable, str(installer), "--project", proj, "--uninstall"],
                            check=True, capture_output=True)
             self.assertFalse(skill.exists())
+            self.assertFalse(profile.exists())
 
     def test_existing_foreign_tidy_skill_left_alone(self):
         installer = Path(__file__).resolve().parent / "install.py"
@@ -855,6 +1050,36 @@ class Installer(unittest.TestCase):
             subprocess.run([sys.executable, str(installer), "--project", proj, "--uninstall"],
                            check=True, capture_output=True)
             self.assertEqual(skill.read_text(), "my own tidy")
+
+
+class Plugin(unittest.TestCase):
+    HERE = Path(__file__).resolve().parent
+
+    def test_plugin_files_match_installer(self):
+        sys.path.insert(0, str(self.HERE))
+        import install
+        for path, text in install.plugin_files().items():
+            self.assertEqual(path.read_text(encoding="utf-8"), text,
+                             f"{path.name} is out of date: run python install.py --build-plugin")
+
+    def test_manifest_versions_match_script(self):
+        sys.path.insert(0, str(self.HERE))
+        import sprawl_guard
+        manifest = json.loads((self.HERE / ".claude-plugin" / "plugin.json").read_text())
+        market = json.loads((self.HERE / ".claude-plugin" / "marketplace.json").read_text())
+        self.assertEqual(manifest["version"], sprawl_guard.VERSION)
+        self.assertEqual(market["plugins"][0]["name"], manifest["name"])
+
+    @unittest.skipUnless(shutil.which("bash"), "needs bash")
+    def test_plugin_hook_command_runs(self):
+        hooks = json.loads((self.HERE / "hooks" / "hooks.json").read_text())["hooks"]
+        command = hooks["SubagentStart"][0]["hooks"][0]["command"]
+        command = command.replace("${CLAUDE_PLUGIN_ROOT}", str(self.HERE))
+        with tempfile.TemporaryDirectory() as proj:
+            env = {**os.environ, "SPRAWL_GUARD_HOME": HOME, "CLAUDE_PROJECT_DIR": proj}
+            res = subprocess.run(["bash", "-c", command], input=b'{"session_id": "p"}',
+                                 capture_output=True, env=env, timeout=60)
+        self.assertIn("Workspace rules", json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"])
 
 
 if __name__ == "__main__":

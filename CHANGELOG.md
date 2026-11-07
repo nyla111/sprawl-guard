@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.5.0 - 2026-11-08
+
+**Manual installs: re-run the installer after updating** (`python3 install.py`, plus
+`--project PATH` if you installed per project) to get the two new hooks and the `/sprawl`
+command, then restart Claude Code. Or switch to the plugin install; use one, not both.
+
+Added:
+- Plugin install: `/plugin install sprawl-guard --marketplace nyla111/sprawl-guard`.
+- Session rules at every session start (startup, resume, `/clear`, compaction), not only after
+  compaction. New `reminder` default `session`; the old behavior is `compact`.
+- Subagents get the same rules when they start (`subagent_rules`).
+- File index: at session start Claude gets a compact list of existing files, one line per
+  folder, so it edits them instead of adding new ones (`file_index`).
+- Profiles: `relaxed`, `default`, `strict` and `off` set several rules at once. Set one with
+  `/sprawl strict` or `python3 sprawl_guard.py profile strict`; your own keys still win.
+- Prose check (`prose`, default `warn`): text Claude writes into `.md`, `.rst` and `.txt` files
+  is scanned for em dashes, "not X, but Y" frames, stock phrases, emoji and similar, and Claude
+  is asked to rewrite those spots. Also on the command line: `python3 sprawl_guard.py prose FILE`.
+- MIT LICENSE.
+
+Changed:
+- Hook events: six instead of four (`post-write` and `subagent-start` are new).
+- The session-start context now also carries a one-line style note when the prose check is on.
+
 ## v0.4.0 - 2026-10-22
 
 **Re-run the installer after updating** (`python3 install.py`, plus `--project PATH` if you

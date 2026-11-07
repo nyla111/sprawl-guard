@@ -1,5 +1,6 @@
 {
-  "_comment": "Copy to ~/.claude/sprawl-guard.json (all projects) or <project>/.claude/sprawl-guard.json (one project). Keep only the keys you want to change. Rule modes: deny | confirm | ask | warn | off.",
+  "_comment": "Copy to ~/.claude/sprawl-guard.json (all projects) or <project>/.claude/sprawl-guard.json (one project). Keep only the keys you want to change. Rule modes: deny | confirm | ask | warn | off. Profiles: relaxed | default | strict | off; keys set here override the profile.",
+  "profile": "default",
   "versioned_files": "deny",
   "backup_files": "deny",
   "versioned_no_base": "warn",
@@ -22,6 +23,13 @@
   "git_checkpoint": true,
   "turn_check": "summary",
   "orphan_check": true,
-  "reminder": "compact",
-  "allow_paths": []
+  "reminder": "session",
+  "subagent_rules": true,
+  "file_index": true,
+  "file_index_max_files": 300,
+  "allow_paths": [],
+  "prose": "warn",
+  "prose_allow": [],
+  "prose_words_extra": [],
+  "prose_skip_paths": []
 }

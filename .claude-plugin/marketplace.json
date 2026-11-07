@@ -1,0 +1,12 @@
+{
+  "name": "sprawl-guard",
+  "description": "sprawl-guard: keep Claude Code from cluttering your workspace",
+  "owner": { "name": "nyla111", "url": "https://github.com/nyla111" },
+  "plugins": [
+    {
+      "name": "sprawl-guard",
+      "source": "./",
+      "description": "Hooks that stop file sprawl, plus a prose check for the docs Claude writes."
+    }
+  ]
+}

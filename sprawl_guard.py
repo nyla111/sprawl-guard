@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """sprawl-guard: stop Claude Code from cluttering your workspace.
 
-One script, four hook events (pass the event as the first argument):
+One script, six hook events (pass the event as the first argument):
   pre-write      PreToolUse on Write/Edit - protected paths for every write or edit;
                  all other rules for every NEW file created with Write
+  post-write     PostToolUse on Write/Edit - prose check of text Claude wrote into docs
   prompt         UserPromptSubmit         - records the prompt (named files, unattended mode) and snapshots
                                            the project for the turn summary; silent by default
-  session-start  SessionStart             - snapshots the workspace; re-adds the rules after compaction
+  session-start  SessionStart             - snapshots the workspace; adds the session rules and file index
+  subagent-start SubagentStart            - gives subagents the same session rules
   stop           Stop                     - end-of-turn summary of files created, edited and deleted (turn_check)
 
 Command line (not a hook):
   tidy [folder] [--json]                  - list existing sprawl; used by the /tidy command
+  profile [name] [--global]               - show or set the profile; used by the /sprawl command
+  prose FILE...                           - run the prose check on files and print the findings
 
 Rule modes:
   deny     blocked; Claude fixes it itself (merge into the original, rename, use the scratchpad)
@@ -38,7 +42,7 @@ import time
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 TAG = "sprawl-guard"
 
 # ---------------------------------------------------------------------------
@@ -47,6 +51,7 @@ TAG = "sprawl-guard"
 
 DEFAULT_CONFIG = {
     "enabled": True,
+    "profile": "default",         # relaxed | default | strict; your own keys still override it
     # --- rule modes: deny | confirm | ask | warn | off ---
     "versioned_files": "deny",    # train_v2.py next to train.py -> Claude merges into train.py
     "backup_files": "deny",       # train_backup.py, paper (1).tex -> always denied, git checkpoint instead
@@ -73,7 +78,16 @@ DEFAULT_CONFIG = {
     "git_checkpoint": True,       # local commit of the original before Claude edits it in place (never pushes)
     "turn_check": "summary",      # off | summary | list | force
     "orphan_check": True,         # turn summary counts new code files nothing references
-    "reminder": "compact",        # compact (after compaction) | always (every prompt) | off
+    "reminder": "session",        # session (every session start, incl. compaction) | compact | always | off
+    "subagent_rules": True,       # give subagents the same session rules
+    "file_index": True,           # list existing project files at session start, so Claude edits instead of adding
+    "file_index_max_files": 300,  # above this, the index lists folders with file counts only
+    # --- prose check: text Claude writes into docs ---
+    "prose": "warn",              # off | warn (clear tells only) | strict (adds the noisier patterns)
+    "prose_extensions": [".md", ".mdx", ".markdown", ".rst", ".txt"],
+    "prose_words_extra": [],      # extra words or phrases to flag
+    "prose_allow": [],            # words or phrases never flagged, e.g. ["seamless"]
+    "prose_skip_paths": [],       # globs the prose check skips, e.g. ["docs/legal/**"]
     # --- word lists ---
     "doc_extensions": [".md", ".markdown", ".txt", ".rst", ".adoc", ".org"],
     "code_extensions": [
@@ -145,24 +159,53 @@ REMINDER = (
     "throwaway scripts go in the session scratchpad; run outputs go in the outputs folder."
 )
 
+PROSE_RULES = (
+    "When writing docs (README, notes, comments), write plainly: no em dashes, no 'not X, but Y' "
+    "frames, no stock phrases (delve, seamless, unlock, game-changer), no emoji, no closing pleasantries."
+)
+
+# Profiles set several rule modes at once. Keys in your own config files always win.
+PROFILES = {
+    "relaxed": {
+        "versioned_files": "warn", "similar_files": "warn", "oneoff_scripts": "warn",
+        "long_names": "warn", "generic_names": "warn", "report_files": "warn",
+        "file_budget": 0, "prose": "off",
+    },
+    "default": {},
+    "strict": {
+        "versioned_no_base": "confirm", "sibling_names": "confirm", "other_docs": "confirm",
+        "outputs_files": "deny", "root_files": "warn", "file_budget": 6,
+        "turn_check": "list", "prose": "strict",
+    },
+}
+
 
 def guard_home() -> Path:
     return Path(os.environ.get("SPRAWL_GUARD_HOME") or (Path.home() / ".claude"))
 
 
+def config_paths(project_dir: Path) -> tuple[Path, Path]:
+    """(global config, project config). The project file overrides the global one."""
+    return guard_home() / "sprawl-guard.json", project_dir / ".claude" / "sprawl-guard.json"
+
+
 def load_config(project_dir: Path) -> dict:
-    cfg = dict(DEFAULT_CONFIG)
-    user_keys: set[str] = set()
-    for path in (guard_home() / "sprawl-guard.json", project_dir / ".claude" / "sprawl-guard.json"):
+    user: dict = {}
+    for path in config_paths(project_dir):
         try:
             with open(path, encoding="utf-8") as f:
-                user = json.load(f)
-            if isinstance(user, dict):
-                clean = {k: v for k, v in user.items() if not k.startswith("_")}
-                cfg.update(clean)
-                user_keys.update(clean)
+                data = json.load(f)
+            if isinstance(data, dict):
+                user.update({k: v for k, v in data.items() if not k.startswith("_")})
         except (OSError, ValueError):
             continue
+    user_keys = set(user)
+    cfg = dict(DEFAULT_CONFIG)
+    profile = str(user.get("profile", cfg["profile"])).lower()
+    if profile == "off":
+        cfg["enabled"] = False
+    cfg.update(PROFILES.get(profile, {}))
+    cfg.update(user)
     # compatibility with older config files
     if "stop_check" in user_keys and "turn_check" not in user_keys:
         cfg["turn_check"] = cfg["stop_check"]
@@ -750,7 +793,7 @@ def handle_prompt(data: dict, cfg: dict) -> None:
         # snapshot at the start of the turn, so changes you made between turns are not counted
         take_snapshot(sid, project_root(data), cfg)
     if cfg.get("reminder") == "always":
-        emit({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": REMINDER}})
+        emit({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": rules_text(cfg)}})
 
 
 MAX_SCAN_FILES = 50000
@@ -898,13 +941,71 @@ def find_orphans(root: Path, new: list[str], cfg: dict) -> list[str]:
     return sorted(remaining)
 
 
+def rules_text(cfg: dict) -> str:
+    text = REMINDER
+    if cfg.get("prose", "off") in ("warn", "strict"):
+        text += " " + PROSE_RULES
+    return text
+
+
+def file_index(files: list[str], max_files: int) -> str:
+    """Compact list of existing files, one line per folder. Folder counts only for big projects."""
+    if not files:
+        return ""
+    by_dir: dict[str, list[str]] = {}
+    for rel in sorted(files):
+        parent, _, name = rel.rpartition("/")
+        by_dir.setdefault(parent, []).append(name)
+    head = "Existing project files (edit these instead of adding new ones):"
+    lines: list[str] = []
+    if len(files) <= max_files:
+        for d in sorted(by_dir):
+            names_ = by_dir[d]
+            shown = ", ".join(names_[:20]) + (f" (+{len(names_) - 20} more)" if len(names_) > 20 else "")
+            lines.append(f"{d + '/' if d else './'}: {shown}")
+    else:
+        head = f"Project has {len(files)} files; folders and file counts:"
+        counts: dict[str, int] = {}
+        for d, names_ in by_dir.items():
+            top = "/".join(d.split("/")[:2]) if d else "."
+            counts[top] = counts.get(top, 0) + len(names_)
+        lines = [f"{d}{'/' if d != '.' else ''} ({n})" for d, n in sorted(counts.items())]
+    text = "\n".join([head] + lines[:80])
+    if len(lines) > 80:
+        text += f"\n(+{len(lines) - 80} more folders)"
+    return text[:6000]
+
+
 def handle_session_start(data: dict, cfg: dict) -> None:
     sid = data.get("session_id") or ""
+    root = project_root(data)
+    source = data.get("source") or "startup"
+    files: dict | None = None
+    complete = False
     if sid and cfg.get("turn_check", "summary") != "off":
-        if load_snapshot(sid, load_state(sid)) is None:
-            take_snapshot(sid, project_root(data), cfg)
-    if data.get("source") == "compact" and cfg.get("reminder") in ("compact", "always"):
-        emit({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": REMINDER}})
+        snap = load_snapshot(sid, load_state(sid))
+        if snap is None:
+            files, complete = take_snapshot(sid, root, cfg)
+        else:
+            files, complete = snap.get("files") or {}, bool(snap.get("complete", True))
+    parts: list[str] = []
+    reminder = cfg.get("reminder", "session")
+    if reminder in ("session", "always") or (reminder == "compact" and source == "compact"):
+        parts.append(rules_text(cfg))
+    if cfg.get("file_index", True) and source != "resume":  # a resumed session already has its index
+        if files is None:
+            files, complete = scan_files(root, cfg, budget=2.0)
+        if complete:
+            index = file_index(list(files), int(cfg.get("file_index_max_files", 300)))
+            if index:
+                parts.append(index)
+    if parts:
+        emit({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "\n\n".join(parts)}})
+
+
+def handle_subagent_start(data: dict, cfg: dict) -> None:
+    if cfg.get("subagent_rules", True) and cfg.get("reminder", "session") != "off":
+        emit({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": rules_text(cfg)}})
 
 
 def names(items: list[str], limit: int = 10) -> str:
@@ -966,6 +1067,265 @@ def handle_stop(data: dict, cfg: dict) -> None:
     if parts:
         # No tag: Claude Code already labels hook messages with the event ("Stop says: ...")
         emit({"systemMessage": " | ".join(parts)})
+
+
+# ---------------------------------------------------------------------------
+# Prose check: wording that reads as machine-written, in docs Claude writes
+# ---------------------------------------------------------------------------
+
+EMOJI = "[\U0001F300-\U0001FAFF☀-➿⭐⬆↔-↪⤴⤵]"
+
+STOCK_WORDS = [
+    "delve", "delves", "delving", "tapestry", "testament to", "seamless", "seamlessly",
+    "game-changer", "game changer", "cutting-edge", "unlock the", "unlocks", "empower", "empowers",
+    "empowering", "elevate", "elevates", "streamline", "streamlines", "streamlined", "realm",
+    "navigate the", "navigating the", "in today's", "fast-paced", "ever-evolving", "ever-changing",
+    "it's worth noting", "it is worth noting", "worth mentioning", "let's dive", "dive into",
+    "deep dive", "whether you're", "embark", "supercharge", "effortless", "effortlessly",
+    "plethora", "myriad", "boasts", "look no further", "rest assured",
+]
+
+STRICT_WORDS = [
+    "crucial", "pivotal", "comprehensive", "landscape", "journey", "a wide range of",
+    "in conclusion", "in summary", "to summarize", "plays a key role", "plays a crucial role",
+    "plays a vital role", "foster", "holistic", "nuanced",
+    "meticulous", "meticulously", "showcase", "showcases",
+]
+
+# (kind, pattern, strict_only)
+PROSE_PATTERNS = [
+    ("em dash", r"—|\s–\s|\s--\s", False),
+    ("contrast frame", r"\bnot (?:just|only|merely|simply)\b[^.;:!?\n]{1,80}?[,;]?\s*(?:but|it'?s|they'?re|this is)\b", False),
+    ("contrast frame", r"\b(?:isn'?t|aren'?t|wasn'?t|weren'?t) (?:just|only|merely|simply)\b[^.;!?\n]{1,80}?\s(?:but|it'?s|they'?re|this is)\b", False),
+    ("contrast frame", r"\b(?:isn'?t|is not|wasn'?t|was not|aren'?t|are not) (?:just )?about\b[^.\n]{1,80}?[,;.]\s*(?:it|this|they)(?:'?s| is| are|'re) about\b", False),
+    ("contrast frame", r"\b(?:it|this|that)(?:'s not| is not| isn'?t)\b[^.\n]{1,60}\.\s+(?:it|this|that)(?:'s| is)\b", False),
+    ("contrast frame", r"\bnot (?:a|an|the)\b [^,.\n]{1,40}, but (?:a|an|the)\b", False),
+    ("self-answered question", r"(?:^|[.!]\s+)(?:The (?:result|catch|answer|upshot|kicker|twist|best part|good news|bad news)|Why does (?:it|this|that) matter|Sound familiar|The bottom line)\?\s+\S", False),
+    ("closing pleasantry", r"\b(?:happy coding|hope this helps|feel free to|don'?t hesitate to|let me know if)\b", False),
+    ("stacked hedge", r"\b(?:may|might|could) (?:potentially|possibly)\b", False),
+]
+
+
+def prose_lines(text: str) -> list[tuple[int, str]]:
+    """(line number, prose text) with code, quotes, front matter, links and comments removed."""
+    out: list[tuple[int, str]] = []
+    lines = text.splitlines()
+    fence = None
+    start = 0
+    if lines and lines[0].strip() == "---":  # front matter
+        for i in range(1, min(len(lines), 200)):
+            if lines[i].strip() in ("---", "..."):
+                start = i + 1
+                break
+    in_comment = False
+    for i in range(start, len(lines)):
+        line = lines[i]
+        s = line.strip()
+        m = re.match(r"(`{3,}|~{3,})", s)
+        if fence:
+            if m and s.startswith(fence):
+                fence = None
+            continue
+        if m:
+            fence = m.group(1)
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        if "<!--" in line and "-->" not in line:
+            in_comment = True
+            continue
+        if s.startswith(">") or (line.startswith(("    ", "\t")) and not re.match(r"\s*([-*+]|\d+[.)])\s", line)):
+            continue
+        clean = re.sub(r"<!--.*?-->", " ", line)
+        clean = re.sub(r"`[^`]*`", " ", clean)
+        clean = re.sub(r"\]\([^)]*\)", "]", clean)
+        clean = re.sub(r"https?://\S+", " ", clean)
+        out.append((i + 1, clean))
+    return out
+
+
+def prose_scan(text: str, cfg: dict) -> list[dict]:
+    """Findings: {line, kind, match}. Deterministic regexes, no model call."""
+    mode = cfg.get("prose", "warn")
+    if mode not in ("warn", "strict"):
+        return []
+    strict = mode == "strict"
+    allow = [str(a).lower() for a in cfg.get("prose_allow") or []]
+    words = list(STOCK_WORDS) + (STRICT_WORDS if strict else []) + [str(w) for w in cfg.get("prose_words_extra") or []]
+    words = [w for w in words if w.lower() not in allow]
+    word_re = re.compile(r"(?<![\w-])(?:" + "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True)) + r")(?![\w-])",
+                         re.IGNORECASE) if words else None
+    patterns = [(k, re.compile(p, re.IGNORECASE if k != "self-answered question" else 0))
+                for k, p, only_strict in PROSE_PATTERNS if strict or not only_strict]
+    emoji_re = re.compile(EMOJI)
+    findings: list[dict] = []
+    bullets = labelled = 0
+
+    def add(n: int, kind: str, found: str) -> None:
+        if any(a in found.lower() for a in allow):
+            return
+        findings.append({"line": n, "kind": kind, "match": found.strip()[:60]})
+
+    for n, line in prose_lines(text):
+        for kind, rx in patterns:
+            for m in rx.finditer(line):
+                add(n, kind, m.group(0))
+        if word_re:
+            for m in word_re.finditer(line):
+                add(n, "stock phrase", m.group(0))
+        stripped = line.strip()
+        is_list = re.match(r"([-*+]|\d+[.)])\s", stripped) is not None
+        is_head = stripped.startswith("#")
+        if emoji_re.search(line) and (strict or is_list or is_head):
+            add(n, "emoji", emoji_re.search(line).group(0))
+        if strict and is_head:
+            words_ = re.findall(r"[A-Za-z][\w'-]*", stripped)
+            long_ = [w for w in words_ if len(w) > 3]
+            if len(long_) >= 3 and all(w[0].isupper() for w in long_) and not stripped.isupper():
+                add(n, "title case heading", stripped.lstrip("# "))
+        if is_list:
+            bullets += 1
+            if re.match(r"([-*+]|\d+[.)])\s+\*\*[^*]{1,40}:?\*\*:?\s", stripped):
+                labelled += 1
+    if strict and labelled >= 4 and labelled > 0.6 * bullets:
+        findings.append({"line": 0, "kind": "bold-label bullets",
+                         "match": f"{labelled} of {bullets} bullets start with a bold label"})
+    return findings
+
+
+def prose_message(rel: str, findings: list[dict], offset: int = 0) -> str:
+    shown = []
+    for f in findings[:15]:
+        where = f"line {f['line'] + offset}" if f["line"] else "whole file"
+        shown.append(f"{where}: '{f['match']}' ({f['kind']})")
+    more = f" (+{len(findings) - 15} more)" if len(findings) > 15 else ""
+    return (f"[{TAG}] Prose check on '{rel}': {len(findings)} phrase(s) that read as machine-written: "
+            + "; ".join(shown) + more + ". Rewrite only those spots in plain wording and keep the meaning; "
+            "do not touch other lines. If the user wrote or asked for this exact wording, leave it.")
+
+
+def handle_post_write(data: dict, cfg: dict) -> None:
+    if cfg.get("prose", "warn") not in ("warn", "strict"):
+        return
+    tool = data.get("tool_name") or ""
+    if tool not in ("Write", "Edit", "MultiEdit"):
+        return
+    tool_input = data.get("tool_input") or {}
+    file_path = tool_input.get("file_path")
+    if not file_path:
+        return
+    root = project_root(data)
+    target = Path(file_path)
+    if not target.is_absolute():
+        target = Path(data.get("cwd") or root) / target
+    target = target.resolve()
+    if not is_within(target, root) or target.suffix.lower() not in [e.lower() for e in cfg["prose_extensions"]]:
+        return
+    if target.stem.lower() in ("license", "notice", "copying", "requirements"):
+        return
+    rel = rel_of(target, root)
+    parts = rel.split("/")[:-1]
+    if any(skip_dir(p, cfg) for p in parts) or protected_match(rel, cfg):
+        return
+    if any(fnmatch.fnmatch(rel, p) for p in cfg.get("prose_skip_paths") or []):
+        return
+    scratchpad = data.get("scratchpad_dir")
+    if scratchpad and is_within(target, Path(scratchpad).resolve()):
+        return
+
+    if tool == "Write":
+        chunks = [(tool_input.get("content") or "", 0)]
+    else:
+        edits = tool_input.get("edits") if tool == "MultiEdit" else [tool_input]
+        try:
+            current = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            current = ""
+        chunks = []
+        for e in edits or []:
+            new = (e or {}).get("new_string") or ""
+            pos = current.find(new) if new else -1
+            chunks.append((new, current.count("\n", 0, pos) if pos >= 0 else 0))
+    findings: list[dict] = []
+    for text, offset in chunks:
+        for f in prose_scan(text, cfg):
+            if f["line"]:
+                f["line"] += offset
+            findings.append(f)
+    if findings:
+        emit({"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                                     "additionalContext": prose_message(rel, findings)}})
+
+
+def run_prose(argv: list[str]) -> int:
+    """sprawl_guard.py prose FILE... : print findings, exit 1 if any (usable in CI)."""
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()).resolve()
+    cfg = load_config(root)
+    if cfg.get("prose", "warn") == "off":
+        cfg["prose"] = "warn"  # asked for explicitly on the command line
+    if "--strict" in argv:
+        cfg["prose"] = "strict"
+    total = 0
+    for name in [a for a in argv if a != "--strict"]:
+        try:
+            text = Path(name).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"{name}: cannot read ({exc.strerror})")
+            continue
+        for f in prose_scan(text, cfg):
+            total += 1
+            print(f"{name}:{f['line']}: {f['kind']}: {f['match']}")
+    print(f"{total} finding(s)")
+    return 1 if total else 0
+
+
+# ---------------------------------------------------------------------------
+# Profiles: /sprawl [relaxed|default|strict|off]
+# ---------------------------------------------------------------------------
+
+def run_profile(argv: list[str]) -> int:
+    root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()).resolve()
+    use_global = "--global" in argv
+    args = [a.lower() for a in argv if not a.startswith("--")]
+    gpath, ppath = config_paths(root)
+    if not args:
+        cfg = load_config(root)
+        state = "off" if not cfg.get("enabled", True) else cfg.get("profile", "default")
+        print(f"Profile: {state} (project file: {ppath if ppath.exists() else 'none'}; "
+              f"global file: {gpath if gpath.exists() else 'none'})")
+        keys = ("versioned_files", "similar_files", "oneoff_scripts", "report_files", "other_docs",
+                "outputs_files", "file_budget", "turn_check", "prose")
+        print("Main settings: " + ", ".join(f"{k}={cfg.get(k)}" for k in keys))
+        return 0
+    name = args[0]
+    if name not in PROFILES and name != "off":
+        print(f"Unknown profile '{name}'. Use one of: relaxed, default, strict, off.")
+        return 0
+    path = gpath if use_global else ppath
+    data: dict = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            data = loaded
+    except (OSError, ValueError):
+        pass
+    data["profile"] = name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    overridden = sorted(k for k in data if k in PROFILES.get(name, {}) and not k.startswith("_"))
+    print(f"Profile set to '{name}' in {path}. It applies from the next file write.")
+    if overridden:
+        print("These keys in that file override the profile: " + ", ".join(overridden))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1211,10 +1571,14 @@ def run_tidy(argv: list[str]) -> int:
 
 HANDLERS = {
     "pre-write": handle_pre_write,
+    "post-write": handle_post_write,
     "prompt": handle_prompt,
     "session-start": handle_session_start,
+    "subagent-start": handle_subagent_start,
     "stop": handle_stop,
 }
+
+COMMANDS = {"tidy": run_tidy, "profile": run_profile, "prose": run_prose}
 
 
 def main() -> int:
@@ -1222,11 +1586,11 @@ def main() -> int:
     if event in ("--version", "-V"):
         print(f"{TAG} {VERSION}")
         return 0
-    if event == "tidy":  # command line, not a hook: prints a plain report for the /tidy command
+    if event in COMMANDS:  # command line, not a hook: prints plain text for /tidy, /sprawl and CI
         try:
-            return run_tidy(sys.argv[2:])
+            return COMMANDS[event](sys.argv[2:])
         except Exception as exc:
-            print(f"{TAG} tidy failed: {exc!r}")
+            print(f"{TAG} {event} failed: {exc!r}")
             return 0
     handler = HANDLERS.get(event)
     if handler is None:

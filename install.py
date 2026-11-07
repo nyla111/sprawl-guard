@@ -4,10 +4,13 @@
   python install.py                      # all your projects   (~/.claude/settings.json)
   python install.py --project PATH       # one project only    (PATH/.claude/settings.local.json)
   python install.py --uninstall [...]    # remove sprawl-guard hooks again
+  python install.py --build-plugin       # maintainers: regenerate hooks/hooks.json and skills/
 
-Also installs the /tidy command as a skill (~/.claude/skills/tidy/SKILL.md, or
-PATH/.claude/skills/tidy/SKILL.md with --project). An existing tidy skill that sprawl-guard
-did not create is left alone.
+Also installs the /tidy and /sprawl commands as skills (~/.claude/skills/<name>/SKILL.md, or
+PATH/.claude/skills/<name>/SKILL.md with --project). An existing skill of the same name that
+sprawl-guard did not create is left alone.
+
+Installing as a Claude Code plugin instead (/plugin install) needs none of this; do not use both.
 
 Uses the absolute path of the Python running this script, so it works the same on
 Windows ("python") and Linux ("python3"). Existing settings are kept, and a backup
@@ -29,8 +32,10 @@ MARKER = "sprawl_guard.py"
 # (event, matcher or None, script argument, timeout seconds)
 HOOKS = [
     ("PreToolUse", "Write|Edit|MultiEdit|NotebookEdit", "pre-write", 20),
+    ("PostToolUse", "Write|Edit|MultiEdit", "post-write", 10),
     ("UserPromptSubmit", None, "prompt", 10),
     ("SessionStart", None, "session-start", 15),
+    ("SubagentStart", None, "subagent-start", 10),
     ("Stop", None, "stop", 15),
 ]
 
@@ -68,23 +73,25 @@ def add_ours(settings: dict) -> None:
         hooks.setdefault(event, []).append(group)
 
 
-SKILL_NAME = "tidy"
 SKILL_MARKER = "<!-- installed by sprawl-guard -->"
 
-SKILL_TEMPLATE = """---
-name: tidy
-description: Find existing file sprawl in this project (_v2/_final copies, backups, near-copies, one-off scripts, report files) and help merge or remove it, asking before every change.
-argument-hint: "[folder]"
+SKILL_HEAD = """---
+name: {name}
+description: {description}
+argument-hint: "{hint}"
 disable-model-invocation: true
-allowed-tools: Bash({command}*)
+allowed-tools:
+{allowed}
 ---
 {marker}
 
-# /tidy
+"""
+
+TIDY_BODY = """# /tidy
 
 Scan results from sprawl-guard:
 
-!`{command} $ARGUMENTS`
+!`{invoke}`
 
 Help the user clean this up. They are present and decide every change.
 
@@ -116,45 +123,118 @@ Help the user clean this up. They are present and decide every change.
    changed and which checkpoint commit holds the old versions. No summary file.
 """
 
+SPRAWL_BODY = """# /sprawl
 
-def skill_dir(project: str | None) -> Path:
+!`{invoke}`
+
+Tell the user the result above in one or two lines. Do not edit config files yourself.
+Profiles: relaxed (most rules only warn), default, strict (tighter rules, file names in the
+turn summary, strict prose check), off (sprawl-guard does nothing in this project).
+"""
+
+SKILLS = {
+    "tidy": {
+        "description": "Find existing file sprawl in this project (_v2/_final copies, backups, near-copies, "
+                       "one-off scripts, report files) and help merge or remove it, asking before every change.",
+        "hint": "[folder]", "cli": "tidy", "body": TIDY_BODY,
+    },
+    "sprawl": {
+        "description": "Show or set the sprawl-guard profile for this project (relaxed, default, strict, off); "
+                       "add --global for all projects.",
+        "hint": "[relaxed|default|strict|off] [--global]", "cli": "profile", "body": SPRAWL_BODY,
+    },
+}
+
+
+def q(p: str) -> str:
+    return f'"{p}"' if " " in p else p
+
+
+def render_skill(name: str, plugin: bool = False) -> str:
+    spec = SKILLS[name]
+    if plugin:
+        # Claude Code fills in ${CLAUDE_PLUGIN_ROOT}; python3 first, python where only that exists (Windows)
+        script = '"${CLAUDE_PLUGIN_ROOT}/sprawl_guard.py"'
+        runners = [f"python3 {script}", f"python {script}"]
+        invoke = " || ".join(f"{r} {spec['cli']} $ARGUMENTS" for r in runners)
+    else:
+        runners = [f"{q(Path(sys.executable).as_posix())} {q(SCRIPT.as_posix())}"]
+        invoke = f"{runners[0]} {spec['cli']} $ARGUMENTS"
+    allowed = "\n".join(f"  - Bash({r}*)" for r in runners)
+    head = SKILL_HEAD.format(name=name, description=spec["description"], hint=spec["hint"],
+                             allowed=allowed, marker=SKILL_MARKER)
+    return head + spec["body"].format(invoke=invoke)
+
+
+def skill_dir(project: str | None, name: str) -> Path:
     base = Path(project).expanduser().resolve() / ".claude" if project else Path.home() / ".claude"
-    return base / "skills" / SKILL_NAME
+    return base / "skills" / name
 
 
-def tidy_command() -> str:
-    def q(p: str) -> str:
-        return f'"{p}"' if " " in p else p
-    py = Path(sys.executable).as_posix()
-    return f"{q(py)} {q(SCRIPT.as_posix())} tidy"
+def install_skills(project: str | None) -> list[str]:
+    notes = []
+    for name in SKILLS:
+        target = skill_dir(project, name) / "SKILL.md"
+        if target.exists() and SKILL_MARKER not in target.read_text(encoding="utf-8", errors="replace"):
+            notes.append(f"Skipped /{name}: {target} already exists and was not made by sprawl-guard.")
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(render_skill(name), encoding="utf-8")
+        notes.append(f"Installed /{name} command: {target}")
+    return notes
 
 
-def install_skill(project: str | None) -> str:
-    target = skill_dir(project) / "SKILL.md"
-    if target.exists() and SKILL_MARKER not in target.read_text(encoding="utf-8", errors="replace"):
-        return f"Skipped /tidy: {target} already exists and was not made by sprawl-guard."
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(SKILL_TEMPLATE.format(command=tidy_command(), marker=SKILL_MARKER), encoding="utf-8")
-    return f"Installed /tidy command: {target}"
+def remove_skills(project: str | None) -> list[str]:
+    notes = []
+    for name in SKILLS:
+        target = skill_dir(project, name) / "SKILL.md"
+        if not target.exists() or SKILL_MARKER not in target.read_text(encoding="utf-8", errors="replace"):
+            continue
+        target.unlink()
+        try:
+            target.parent.rmdir()
+        except OSError:
+            pass
+        notes.append(f"Removed /{name} command: {target}")
+    return notes
 
 
-def remove_skill(project: str | None) -> str | None:
-    target = skill_dir(project) / "SKILL.md"
-    if not target.exists() or SKILL_MARKER not in target.read_text(encoding="utf-8", errors="replace"):
-        return None
-    target.unlink()
-    try:
-        target.parent.rmdir()
-    except OSError:
-        pass
-    return f"Removed /tidy command: {target}"
+def plugin_hooks() -> dict:
+    """hooks/hooks.json for the plugin install: shell form, python3 with a python fallback."""
+    hooks: dict = {}
+    for event, matcher, arg, timeout in HOOKS:
+        script = '"${CLAUDE_PLUGIN_ROOT}/sprawl_guard.py"'
+        group = {"hooks": [{"type": "command", "timeout": timeout,
+                            "command": f"python3 {script} {arg} || python {script} {arg}"}]}
+        if matcher:
+            group = {"matcher": matcher, **group}
+        hooks.setdefault(event, []).append(group)
+    return {"hooks": hooks}
+
+
+def plugin_files() -> dict[Path, str]:
+    files = {HERE / "hooks" / "hooks.json": json.dumps(plugin_hooks(), indent=2) + "\n"}
+    for name in SKILLS:
+        files[HERE / "skills" / name / "SKILL.md"] = render_skill(name, plugin=True)
+    return files
+
+
+def build_plugin() -> int:
+    for path, text in plugin_files().items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        print(f"Wrote {path.relative_to(HERE).as_posix()}")
+    return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--project", metavar="PATH", help="install for one project only")
     ap.add_argument("--uninstall", action="store_true", help="remove sprawl-guard hooks")
+    ap.add_argument("--build-plugin", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.build_plugin:
+        return build_plugin()
 
     if args.project:
         target = Path(args.project).expanduser().resolve() / ".claude" / "settings.local.json"
@@ -180,8 +260,7 @@ def main() -> int:
     target.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     action = "Removed from" if args.uninstall else "Installed into"
     print(f"{action} {target}")
-    note = remove_skill(args.project) if args.uninstall else install_skill(args.project)
-    if note:
+    for note in (remove_skills(args.project) if args.uninstall else install_skills(args.project)):
         print(note)
     if not args.uninstall:
         print(f"Python: {sys.executable}")
