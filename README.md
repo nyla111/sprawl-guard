@@ -33,6 +33,7 @@ On Claude Code before 2.1.275, run `/plugin marketplace add nyla111/sprawl-guard
 `/plugin install sprawl-guard@sprawl-guard`. Restart Claude Code afterwards. On Windows the
 plugin needs Git Bash; without it, use the manual install.
 
+
 **Manual.** Clone to a permanent folder and run the installer:
 
 ```bash
