@@ -612,7 +612,7 @@ class Prose(Base):
     def test_cli(self):
         self.touch("a.md", self.TEXT)
         res = subprocess.run([sys.executable, str(SCRIPT), "prose", str(self.root / "a.md")],
-                             capture_output=True, env={**os.environ, "SPRAWL_GUARD_HOME": HOME}, timeout=60)
+                             capture_output=True, env={**os.environ, "SPRAWL_GUARD_HOME": HOME, "PYTHONIOENCODING": "utf-8"}, timeout=60)
         self.assertEqual(res.returncode, 1)
         self.assertIn("2 finding(s)", res.stdout.decode())
 
