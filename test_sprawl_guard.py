@@ -19,6 +19,21 @@ SCRIPT = Path(__file__).resolve().parent / "sprawl_guard.py"
 HOME = tempfile.mkdtemp(prefix="sprawl-guard-home-")  # isolates global config and log
 HAS_GIT = shutil.which("git") is not None
 
+
+def find_bash():
+    """bash as Claude Code uses it. On Windows that is Git Bash, not the WSL bash.exe in System32."""
+    if os.name != "nt":
+        return shutil.which("bash")
+    git = shutil.which("git")
+    candidates = [r"C:\Program Files\Git\bin\bash.exe"]
+    if git:
+        gitroot = Path(git).resolve().parent.parent  # ...\Git\cmd\git.exe -> ...\Git
+        candidates.insert(0, str(gitroot / "bin" / "bash.exe"))
+    return next((c for c in candidates if Path(c).is_file()), None)
+
+
+BASH = find_bash()
+
 CODE = "\n".join(
     ["import argparse", "import torch", "", "def build_model(cfg):", "    layers = []"]
     + [f"    layers.append(torch.nn.Linear({i}, {i + 1}))" for i in range(1, 13)]
@@ -49,7 +64,7 @@ class Base(unittest.TestCase):
     def touch(self, rel, text="x"):
         p = self.root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
+        p.write_text(text, encoding="utf-8")  # Claude Code writes UTF-8 on every platform
         return p
 
     def config(self, **cfg):
@@ -1296,14 +1311,14 @@ class Plugin(unittest.TestCase):
         self.assertEqual(manifest["version"], sprawl_guard.VERSION)
         self.assertEqual(market["plugins"][0]["name"], manifest["name"])
 
-    @unittest.skipUnless(shutil.which("bash"), "needs bash")
+    @unittest.skipUnless(BASH, "needs bash (Git Bash on Windows)")
     def test_plugin_hook_command_runs(self):
         hooks = json.loads((self.HERE / "hooks" / "hooks.json").read_text())["hooks"]
         command = hooks["SubagentStart"][0]["hooks"][0]["command"]
         command = command.replace("${CLAUDE_PLUGIN_ROOT}", str(self.HERE))
         with tempfile.TemporaryDirectory() as proj:
             env = {**os.environ, "SPRAWL_GUARD_HOME": HOME, "CLAUDE_PROJECT_DIR": proj}
-            res = subprocess.run(["bash", "-c", command], input=b'{"session_id": "p"}',
+            res = subprocess.run([BASH, "-c", command], input=b'{"session_id": "p"}',
                                  capture_output=True, env=env, timeout=60)
         self.assertIn("Workspace rules", json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"])
 
