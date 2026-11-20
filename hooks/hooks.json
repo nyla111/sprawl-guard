@@ -10,6 +10,16 @@
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/sprawl_guard.py\" pre-write || python \"${CLAUDE_PLUGIN_ROOT}/sprawl_guard.py\" pre-write"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/sprawl_guard.py\" pre-bash || python \"${CLAUDE_PLUGIN_ROOT}/sprawl_guard.py\" pre-bash"
+          }
+        ]
       }
     ],
     "PostToolUse": [

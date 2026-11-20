@@ -10,7 +10,10 @@ however deep the session is. The checks run locally, cost no tokens, and make no
 ## What it does
 
 - Checks every new file before it is written, and blocks or redirects versioned copies, backups,
-  near-duplicates, one-off scripts, report files and badly named files.
+  near-duplicates, one-off scripts, report files and badly named files. Notes worth keeping go
+  into one notes file instead of new reports.
+- Applies the same rules to files created by shell commands (`>`, `tee`, `touch`, `cp`,
+  `python -c "open(..., 'w')"`).
 - Gives Claude the workspace rules and a list of existing files at every session start, and the
   same rules to subagents.
 - Counts the files created, edited and deleted at the end of each turn, including changes made
@@ -18,10 +21,11 @@ however deep the session is. The checks run locally, cost no tokens, and make no
 - Checks the docs Claude writes for wording that reads as machine-written (em dashes,
   "not X, but Y" frames, stock phrases) and asks it to rewrite those spots.
 - `/tidy` cleans up sprawl that already exists, with your approval for every change.
+- `/sprawl-stats` shows what was caught per rule, including blocked files created anyway.
 
 ## Install
 
-Requires Python 3.8+ and git. Install on every machine where you run Claude Code.
+Requires Python 3.9+ and git. Install on every machine where you run Claude Code.
 
 **Plugin** (recommended). In Claude Code:
 
@@ -54,9 +58,10 @@ Use one install method, not both.
 |---|---|---|
 | `/tidy [folder]` | `/sprawl-guard:tidy` | Lists existing sprawl and merges or removes it with you, one group at a time, after a local git checkpoint |
 | `/sprawl [profile] [--global]` | `/sprawl-guard:sprawl` | Shows or sets the profile: `relaxed`, `default`, `strict` or `off` |
+| `/sprawl-stats [--days N]` | `/sprawl-guard:sprawl-stats` | Warnings and blocks per rule, blocked files created anyway, prose findings (last 30 days) |
 
-From a terminal: `python3 sprawl_guard.py tidy`, `profile` or `prose FILE...`. The `prose`
-command exits with 1 when it finds something, so it works in CI.
+From a terminal: `python3 sprawl_guard.py tidy`, `profile`, `stats` or `prose FILE...`. The
+`prose` command exits with 1 when it finds something, so it works in CI.
 
 ## Rules for new files
 
@@ -70,7 +75,7 @@ you), `ask` (permission prompt), `warn` (allowed with a note) or `off`.
 | `versioned_no_base` | `resnet_v2.py` with no `resnet.py` | `warn` |
 | `similar_files` | new file 60%+ identical to an existing one | `deny`: use a config entry or argument |
 | `sibling_names` | `train_resnet.py` next to `train.py` | `warn` |
-| `report_files` | `SUMMARY.md`, `final_report.txt` | `confirm` |
+| `report_files` | `SUMMARY.md`, `final_report.txt` | `confirm`: chat reply, or append to the notes file |
 | `other_docs` | `design.md` | `warn` |
 | `oneoff_scripts` | `debug_*`, `tmp_*`, `scratch*` | `deny`: use the session scratchpad |
 | `long_names` | over 30 characters or 3 separators | `deny` |
@@ -81,6 +86,10 @@ you), `ask` (permission prompt), `warn` (allowed with a note) or `off`.
 
 If you name the file in your prompt or ask for "a new version" or "a separate file", `deny`
 becomes `confirm`, so you decide. Backups and protected paths stay denied.
+
+Files created by shell commands go through the same rules (`bash_check`). In the default `warn`
+mode Claude gets a note before the command runs; `block` turns `deny` and `confirm` into blocks.
+Writes into protected paths are blocked in both modes.
 
 Editing existing files outside protected paths is always allowed, as are standard repo files (README, LICENSE,
 CHANGELOG, CLAUDE.md, ...) and anything in the scratchpad, `.git`, `node_modules`, `venv` and
@@ -98,6 +107,9 @@ including the word lists, are at the top of `sprawl_guard.py`.
 | `profile` | `default` | `relaxed` turns most denies into warnings; `strict` tightens rules and the prose check. Your own keys override it |
 | `protected_paths` | `[]` | Never created, edited or overwritten, e.g. `["data/raw/**", "results/final"]` |
 | `outputs_dir` | `outputs` | Where logs, checkpoints and results belong |
+| `notes_files` | `docs/NOTES.md`, `NOTES.md`, `docs/EXPERIMENTS.md`, `EXPERIMENTS.md` | Where notes worth keeping go: the first that exists, else the first entry. `[]` turns this off |
+| `bash_check` | `warn` | Files created by shell commands: `warn`, `block`, `report` (stats only) or `off` |
+| `stats` | `true` | Record warnings and blocks in `~/.claude/sprawl-guard-stats/` for `/sprawl-stats` |
 | `allow_paths` | `[]` | Globs that are always allowed, e.g. `["docs/**"]` |
 | `git_checkpoint` | `true` | Commit the original locally before Claude merges into it (never pushes) |
 | `turn_check` | `summary` | End-of-turn message: `summary`, `list` (with file names), `force` (Claude must clean up first) or `off` |
@@ -122,16 +134,24 @@ flagged. It removes common surface patterns; it does not make text undetectable.
 
 ## Limits
 
-- Files created through shell commands are counted at the end of the turn, not blocked.
-  Protected paths cover Claude's file tools only.
+- The shell check reads the obvious forms only. Commands with variables, globs or command
+  substitution, `mv`, and files written by scripts Claude runs are counted at the end of the
+  turn, not checked before.
 - Detection uses name, content and keyword heuristics. Adjust the word lists if they misfire.
 - The prose check is a fixed pattern list and does not check chat replies.
+
+## Benchmark
+
+`python3 bench/run.py --allow-bash` runs 10 tasks on a small fixture project, each once with
+sprawl-guard and once without, and counts new files, versioned copies, one-off scripts, stray
+docs and unreferenced code. Every run is a real Claude Code session and costs tokens. No
+results are published yet.
 
 ## Development
 
 Run the tests with `python3 -m unittest test_sprawl_guard`. The plugin files in `hooks/` and
 `skills/` are generated with `python3 install.py --build-plugin`, and a test fails if they are
-out of date. Set `SPRAWL_GUARD_DEBUG=1` to log each decision. See [CHANGELOG.md](CHANGELOG.md)
+out of date. GitHub Actions runs the tests on Linux, Windows and macOS. Set `SPRAWL_GUARD_DEBUG=1` to log each decision. See [CHANGELOG.md](CHANGELOG.md)
 for release notes, including when to re-run the installer.
 
 ## License
