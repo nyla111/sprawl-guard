@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """sprawl-guard: stop Claude Code from cluttering your workspace.
 
-One script, six hook events (pass the event as the first argument):
+One script, seven hook events (pass the event as the first argument):
   pre-write      PreToolUse on Write/Edit - protected paths for every write or edit;
                  all other rules for every NEW file created with Write
+  pre-bash       PreToolUse on Bash       - the same rules for files a shell command creates
+                                           (>, >>, tee, touch, cp, python open(..., 'w')); bash_check
   post-write     PostToolUse on Write/Edit - prose check of text Claude wrote into docs
   prompt         UserPromptSubmit         - records the prompt (named files, unattended mode) and snapshots
                                            the project for the turn summary; silent by default
@@ -15,6 +17,7 @@ Command line (not a hook):
   tidy [folder] [--json]                  - list existing sprawl; used by the /tidy command
   profile [name] [--global]               - show or set the profile; used by the /sprawl command
   prose FILE...                           - run the prose check on files and print the findings
+  stats [--days N] [--all] [--json]       - what sprawl-guard caught in this project
 
 Rule modes:
   deny     blocked; Claude fixes it itself (merge into the original, rename, use the scratchpad)
@@ -31,9 +34,11 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
+import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -42,7 +47,7 @@ import time
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 TAG = "sprawl-guard"
 
 # ---------------------------------------------------------------------------
@@ -78,7 +83,11 @@ DEFAULT_CONFIG = {
     "git_checkpoint": True,       # local commit of the original before Claude edits it in place (never pushes)
     "turn_check": "summary",      # off | summary | list | force
     "orphan_check": True,         # turn summary counts new code files nothing references
-    "reminder": "session",        # session (every session start, incl. compaction) | compact | always | off
+    "notes_files": ["docs/NOTES.md", "NOTES.md", "docs/EXPERIMENTS.md", "EXPERIMENTS.md"],
+                                  # report files are steered here: the first that exists, else the first entry ([] = off)
+    "bash_check": "warn",         # off | report | warn | block: files created by shell commands (>, tee, touch, cp)
+    "stats": True,                # record every warning and block for `sprawl_guard.py stats`
+    "reminder": "session",       # session (every session start, incl. compaction) | compact | always | off
     "subagent_rules": True,       # give subagents the same session rules
     "file_index": True,           # list existing project files at session start, so Claude edits instead of adding
     "file_index_max_files": 300,  # above this, the index lists folders with file counts only
@@ -169,13 +178,13 @@ PROFILES = {
     "relaxed": {
         "versioned_files": "warn", "similar_files": "warn", "oneoff_scripts": "warn",
         "long_names": "warn", "generic_names": "warn", "report_files": "warn",
-        "file_budget": 0, "prose": "off",
+        "file_budget": 0, "prose": "off", "bash_check": "report",
     },
     "default": {},
     "strict": {
         "versioned_no_base": "confirm", "sibling_names": "confirm", "other_docs": "confirm",
         "outputs_files": "deny", "root_files": "warn", "file_budget": 6,
-        "turn_check": "list", "prose": "strict",
+        "turn_check": "list", "prose": "strict", "bash_check": "block",
     },
 }
 
@@ -311,6 +320,47 @@ def log_event(st: dict, root: Path, text: str) -> None:
         guard_home().mkdir(parents=True, exist_ok=True)
         with open(log_path(), "a", encoding="utf-8") as f:
             f.write(f"{datetime.now().isoformat(timespec='seconds')}\t{root}\t{text}\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Stats log: one JSON line per warning or block, per project, outside the project
+# ---------------------------------------------------------------------------
+
+# finding kind -> config key, so stats speak in rule names
+KIND_RULE = {
+    "versioned": "versioned_files", "backup": "backup_files", "versioned_no_base": "versioned_no_base",
+    "similar": "similar_files", "sibling": "sibling_names", "report": "report_files", "doc": "other_docs",
+    "oneoff": "oneoff_scripts", "long": "long_names", "generic": "generic_names",
+    "outputs": "outputs_files", "root": "root_files", "budget": "file_budget", "protected": "protected_paths",
+}
+STATS_MAX_BYTES = 2_000_000
+
+
+def stats_path(root: Path) -> Path:
+    digest = hashlib.sha1(norm(root).encode("utf-8")).hexdigest()[:10]
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", root.name)[:40] or "root"
+    return guard_home() / "sprawl-guard-stats" / f"{name}-{digest}.jsonl"
+
+
+def record(cfg: dict, root: Path, sid: str, source: str, kind: str, action: str,
+           path: str = "", n: int = 1) -> None:
+    """source: write | bash | prose | turn. action: blocked | confirm | prompted | warned |
+    unattended | report | created_after_block."""
+    if not cfg.get("stats", True):
+        return
+    entry = {"t": datetime.now().isoformat(timespec="seconds"), "root": str(root), "session": sid,
+             "source": source, "rule": KIND_RULE.get(kind, kind), "action": action, "path": path}
+    if n != 1:
+        entry["n"] = n
+    try:
+        p = stats_path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.exists() and p.stat().st_size > STATS_MAX_BYTES:
+            os.replace(p, p.with_name(p.name + ".1"))
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=True) + "\n")
     except OSError:
         pass
 
@@ -467,11 +517,27 @@ def requested(target: Path, prompt: str, cfg: dict) -> tuple[bool, bool]:
     return named, asked
 
 
-def judge_new_file(target: Path, rel: str, cfg: dict, scratchpad: str | None, content: str) -> list[dict]:
+def notes_entries(cfg: dict) -> list[str]:
+    return [str(e).replace("\\", "/").strip("/") for e in cfg.get("notes_files") or [] if str(e).strip()]
+
+
+def notes_file(root: Path, cfg: dict) -> str | None:
+    """The project's notes file: the first notes_files entry that exists, else the first entry."""
+    entries = notes_entries(cfg)
+    for e in entries:
+        if (root / e).is_file():
+            return e
+    return entries[0] if entries else None
+
+
+def judge_new_file(target: Path, rel: str, cfg: dict, scratchpad: str | None, content: str,
+                   root: Path | None = None) -> list[dict]:
     """All rule findings for a new file. Each: mode, kind, issue, fix, alt, soften, ref."""
     for pattern in cfg.get("allow_paths", []):
         if fnmatch.fnmatch(rel, pattern):
             return []
+    if rel.lower() in [e.lower() for e in notes_entries(cfg)]:
+        return []  # creating the one notes file is the fix, not sprawl
     out_dir = str(cfg.get("outputs_dir") or "").strip("/\\")
     if out_dir and out_dir.lower() in [p.lower() for p in rel.split("/")[:-1]]:
         return []  # inside the outputs folder anything goes
@@ -537,10 +603,17 @@ def judge_new_file(target: Path, rel: str, cfg: dict, scratchpad: str | None, co
     # 3. docs and reports
     if is_doc and not standard and base.lower() not in allowed:
         if any(t in cfg["report_keywords"] for t in toks):
+            entries = notes_entries(cfg)
+            notes = notes_file(root, cfg) if root is not None else (entries[0] if entries else None)
+            if notes:
+                fix = (f"Summaries go in the chat reply. If it should be kept, append it as a dated section "
+                       f"to '{notes}' (create that file if it does not exist) instead of a new file.")
+                alt = ["put it in the chat reply instead of a file", f"append it to '{notes}'"]
+            else:
+                fix = "Summaries go in the chat reply unless the user asked for a file."
+                alt = "put it in the chat reply instead of a file"
             add(cfg["report_files"], "report",
-                f"'{rel}' is a new report or summary document.",
-                "Summaries go in the chat reply unless the user asked for a file.",
-                alt="put it in the chat reply instead of a file")
+                f"'{rel}' is a new report or summary document.", fix, alt=alt)
         else:
             add(cfg["other_docs"], "doc",
                 f"'{rel}' is a new document.",
@@ -663,8 +736,10 @@ def confirm_message(rel: str, conf: list[dict]) -> str:
     issues = " ".join(f["issue"] for f in conf)
     alts: list[str] = []
     for f in conf:
-        if f.get("alt") and f["alt"] not in alts:
-            alts.append(f["alt"])
+        given = f.get("alt") or []
+        for a in [given] if isinstance(given, str) else given:
+            if a not in alts:
+                alts.append(a)
     options = alts + [f"create '{rel}' anyway", "use a different name or location"]
     listed = "; ".join(f"({i}) {o}" for i, o in enumerate(options, 1))
     return (f"[{TAG}] {issues} Do not decide this yourself: ask the user, with your multiple-choice "
@@ -692,6 +767,7 @@ def handle_pre_write(data: dict, cfg: dict) -> None:
     # Protected paths: no write or edit of any kind, new or existing file.
     pattern = protected_match(rel, cfg)
     if pattern:
+        record(cfg, root, data.get("session_id") or "", "write", "protected", "blocked", rel)
         emit(pre_tool("deny",
              f"[{TAG}] '{rel}' is inside a protected path ('{pattern}'). Do not create, edit or overwrite "
              f"files there. If the user really wants this, they must first remove that entry from "
@@ -711,7 +787,7 @@ def handle_pre_write(data: dict, cfg: dict) -> None:
     st = load_state(sid)
     unattended = truthy_env("SPRAWL_GUARD_UNATTENDED") or bool(st.get("unattended"))
     named, asked = requested(target, st.get("prompt", ""), cfg)
-    findings = judge_new_file(target, rel, cfg, scratchpad, tool_input.get("content") or "")
+    findings = judge_new_file(target, rel, cfg, scratchpad, tool_input.get("content") or "", root)
 
     # Something the user explicitly asked for is never silently fixed: ask them instead.
     for f in findings:
@@ -723,6 +799,11 @@ def handle_pre_write(data: dict, cfg: dict) -> None:
     out: dict = {}
     let_through = False
 
+    def note_all(mode: str, action: str) -> None:
+        for f in findings:
+            if f["mode"] == mode:
+                record(cfg, root, sid, "write", f["kind"], action, rel)
+
     if top == SEVERITY["deny"]:
         parts = []
         for f in findings:
@@ -733,23 +814,31 @@ def handle_pre_write(data: dict, cfg: dict) -> None:
                 note = checkpoint_note(root, f["ref"], st)
             parts.append(f"{f['issue']} {f['fix']}{note}")
         out = pre_tool("deny", f"[{TAG}] " + " ".join(parts))
+        note_all("deny", "blocked")
+        blocked = st.setdefault("blocked", {})
+        blocked[rel] = next(f["kind"] for f in findings if f["mode"] == "deny")
     elif top == SEVERITY["confirm"]:
         conf = [f for f in findings if f["mode"] == "confirm"]
         if unattended:
             log_event(st, root, f"{rel} ({conf[0]['issue']})")
+            note_all("confirm", "unattended")
             let_through = True
         elif key in st.get("pending", []):
             out = pre_tool("ask", f"[{TAG}] Confirm creating '{rel}': " + " ".join(f["issue"] for f in conf))
+            note_all("confirm", "prompted")
             let_through = True
         else:
             st.setdefault("pending", []).append(key)
             out = pre_tool("deny", confirm_message(rel, conf))
+            note_all("confirm", "confirm")
     elif top == SEVERITY["ask"]:
         asks = [f for f in findings if f["mode"] == "ask"]
         if unattended:
             log_event(st, root, f"{rel} ({asks[0]['issue']})")
+            note_all("ask", "unattended")
         else:
             out = pre_tool("ask", f"[{TAG}] " + " ".join(f"{f['issue']} {f['fix']}" for f in asks))
+            note_all("ask", "prompted")
         let_through = True
     else:
         let_through = True
@@ -762,18 +851,23 @@ def handle_pre_write(data: dict, cfg: dict) -> None:
         if not out and budget > 0 and len(created) >= budget and SEVERITY.get(budget_mode, 0) > 0:
             msg = f"'{rel}' would be new file number {len(created) + 1} this session (budget {budget})."
             if SEVERITY[budget_mode] == SEVERITY["warn"]:
-                findings.append({"mode": "warn", "issue": msg, "fix": "Prefer editing existing files."})
+                findings.append({"mode": "warn", "kind": "budget", "issue": msg, "fix": "Prefer editing existing files."})
             elif unattended:
                 log_event(st, root, msg)
+                record(cfg, root, sid, "write", "budget", "unattended", rel)
             else:
                 out = pre_tool("ask", f"[{TAG}] {msg} Approve only if this file is really needed.")
+                record(cfg, root, sid, "write", "budget", "prompted", rel)
         created.append(key)
+    if let_through:
+        st.get("blocked", {}).pop(rel, None)  # approved later (e.g. the user asked for it after all)
 
     warns = [f for f in findings if f["mode"] == "warn"]
     if warns and (not out or out["hookSpecificOutput"].get("permissionDecision") == "ask"):
         out = out or {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
         out["hookSpecificOutput"]["additionalContext"] = (
             f"[{TAG}] " + " ".join(f"{f['issue']} {f['fix']}" for f in warns))
+        note_all("warn", "warned")
 
     save_state(sid, st)
     debug(f"pre-write {rel} -> {out or 'allow'}")
@@ -793,7 +887,8 @@ def handle_prompt(data: dict, cfg: dict) -> None:
         # snapshot at the start of the turn, so changes you made between turns are not counted
         take_snapshot(sid, project_root(data), cfg)
     if cfg.get("reminder") == "always":
-        emit({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": rules_text(cfg)}})
+        emit({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                     "additionalContext": rules_text(cfg, project_root(data))}})
 
 
 MAX_SCAN_FILES = 50000
@@ -897,8 +992,19 @@ def compare(prev: dict, cur: dict) -> tuple[list[str], list[str], list[str]]:
     return created, edited, deleted
 
 
-def find_orphans(root: Path, new: list[str], cfg: dict) -> list[str]:
+def walk_rels(root: Path, cfg: dict):
+    """Relative paths from a filesystem walk; the fallback outside git repos."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not skip_dir(d, cfg)]
+        rel_dir = os.path.relpath(dirpath, root)
+        for name in filenames:
+            yield (name if rel_dir == "." else os.path.join(rel_dir, name)).replace("\\", "/")
+
+
+def find_orphans(root: Path, new: list[str], cfg: dict, files: list[str] | None = None) -> list[str]:
     """New code files whose name appears in no other text file of the project.
+    `files` is the project file list from the turn scan (git-aware: tracked plus untracked,
+    .gitignore respected); without it the folder is walked.
     Returns [] when the scan cannot finish in time, so it never claims a false orphan."""
     code_exts = {e.lower() for e in cfg["code_extensions"]}
     skip_stems = {"__init__", "__main__", "conftest", "setup", "main"}
@@ -916,33 +1022,32 @@ def find_orphans(root: Path, new: list[str], cfg: dict) -> list[str]:
         return []
     text_exts = code_exts | {".md", ".txt", ".rst", ".yaml", ".yml", ".json", ".toml", ".cfg", ".ini"}
     deadline = time.monotonic() + 3.0
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not skip_dir(d, cfg)]
-        rel_dir = os.path.relpath(dirpath, root)
-        for name in filenames:
-            if os.path.splitext(name)[1].lower() not in text_exts:
+    for rel in (files if files is not None else walk_rels(root, cfg)):
+        if os.path.splitext(rel)[1].lower() not in text_exts:
+            continue
+        full = os.path.join(root, rel)
+        try:
+            if os.path.getsize(full) > 1_000_000:
                 continue
-            rel = (name if rel_dir == "." else os.path.join(rel_dir, name)).replace("\\", "/")
-            full = os.path.join(dirpath, name)
-            try:
-                if os.path.getsize(full) > 1_000_000:
-                    continue
-                with open(full, encoding="utf-8", errors="replace") as f:
-                    text = f.read()
-            except OSError:
-                continue
-            for cand, pattern in list(remaining.items()):
-                if cand != rel and pattern.search(text):
-                    del remaining[cand]
-            if not remaining:
-                return []
-            if time.monotonic() > deadline:
-                return []
+            with open(full, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for cand, pattern in list(remaining.items()):
+            if cand != rel and pattern.search(text):
+                del remaining[cand]
+        if not remaining:
+            return []
+        if time.monotonic() > deadline:
+            return []
     return sorted(remaining)
 
 
-def rules_text(cfg: dict) -> str:
+def rules_text(cfg: dict, root: Path | None = None) -> str:
     text = REMINDER
+    notes = notes_file(root, cfg) if root is not None else None
+    if notes:
+        text += f" Notes worth keeping are appended to '{notes}', not written as new report files."
     if cfg.get("prose", "off") in ("warn", "strict"):
         text += " " + PROSE_RULES
     return text
@@ -991,7 +1096,7 @@ def handle_session_start(data: dict, cfg: dict) -> None:
     parts: list[str] = []
     reminder = cfg.get("reminder", "session")
     if reminder in ("session", "always") or (reminder == "compact" and source == "compact"):
-        parts.append(rules_text(cfg))
+        parts.append(rules_text(cfg, root))
     if cfg.get("file_index", True) and source != "resume":  # a resumed session already has its index
         if files is None:
             files, complete = scan_files(root, cfg, budget=2.0)
@@ -1005,7 +1110,8 @@ def handle_session_start(data: dict, cfg: dict) -> None:
 
 def handle_subagent_start(data: dict, cfg: dict) -> None:
     if cfg.get("subagent_rules", True) and cfg.get("reminder", "session") != "off":
-        emit({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": rules_text(cfg)}})
+        emit({"hookSpecificOutput": {"hookEventName": "SubagentStart",
+                                     "additionalContext": rules_text(cfg, project_root(data))}})
 
 
 def names(items: list[str], limit: int = 10) -> str:
@@ -1033,8 +1139,12 @@ def handle_stop(data: dict, cfg: dict) -> None:
         if previous is not None and previous.get("complete", True) and complete:
             new, edited, deleted = compare(previous["files"], current)
     st.pop("snapshot", None)
+    # files that were blocked this turn but exist now: Claude got around the block (shell, other tool)
+    around = sorted((rel, kind) for rel, kind in st.pop("blocked", {}).items() if (root / rel).is_file())
+    for rel, kind in around:
+        record(cfg, root, sid, "turn", kind, "created_after_block", rel)
     save_state(sid, st)
-    orphans = find_orphans(root, new, cfg) if new and cfg.get("orphan_check", True) else []
+    orphans = find_orphans(root, new, cfg, list(current)) if new and cfg.get("orphan_check", True) else []
 
     if mode == "force" and new and not data.get("stop_hook_active"):
         extra = f" These are not referenced anywhere: {names(orphans)}." if orphans else ""
@@ -1057,6 +1167,9 @@ def handle_stop(data: dict, cfg: dict) -> None:
                        (orphans, "not referenced")) if items]
             line += " (" + "; ".join(listed) + ")"
         parts.append(line)
+    if around and mode != "off":
+        listed = f": {names([r for r, _ in around])}" if mode == "list" else ""
+        parts.append(f"{len(around)} blocked file(s) were created anyway{listed}")
     if turn_log:
         if mode == "list":
             parts.append("allowed because unattended: " + "; ".join(turn_log[:10]))
@@ -1067,6 +1180,218 @@ def handle_stop(data: dict, cfg: dict) -> None:
     if parts:
         # No tag: Claude Code already labels hook messages with the event ("Stop says: ...")
         emit({"systemMessage": " | ".join(parts)})
+
+
+# ---------------------------------------------------------------------------
+# Bash check: files created by shell commands (>, >>, tee, touch, cp, python -c open(..., 'w'))
+# ---------------------------------------------------------------------------
+
+HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+PY_WRITE_RES = [
+    re.compile(r"""\bopen\(\s*(['"])([^'"\n]+)\1\s*,\s*(['"])[^'"\n]*[wax][^'"\n]*\3"""),
+    re.compile(r"""\bPath\(\s*(['"])([^'"\n]+)\1\s*\)\s*\.\s*write_(?:text|bytes)\("""),
+]
+FILE_REDIRECTS = {">", ">>", ">|", "&>", "&>>"}
+OTHER_REDIRECTS = {">&", "<&", "<", "<>", "<<<", "&>&"}
+CMD_SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", ";;", "|&", ";&"}
+CMD_WRAPPERS = {"sudo", "env", "command", "nohup", "time", "exec", "builtin"}
+
+
+def split_heredocs(command: str) -> tuple[str, list[str]]:
+    """Command text with here-doc bodies removed (lines joined by ';'), and the bodies in order."""
+    lines = command.replace("\\\r\n", " ").replace("\\\n", " ").splitlines()
+    kept: list[str] = []
+    bodies: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        kept.append(line)
+        i += 1
+        for m in HEREDOC_RE.finditer(line):
+            body: list[str] = []
+            while i < len(lines) and lines[i].strip() != m.group(2):
+                body.append(lines[i])
+                i += 1
+            i += 1  # the closing delimiter
+            bodies.append("\n".join(body))
+    return " ; ".join(kept), bodies
+
+
+def shell_tokens(text: str) -> list[str]:
+    lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
+    lex.whitespace_split = True
+    lex.commenters = ""
+    return list(lex)
+
+
+def bash_targets(command: str, cwd: Path) -> list[tuple[str, Path, str]]:
+    """Files a shell command writes: (path as written, folder it is relative to, content if known).
+    Only the obvious forms; anything with variables, globs or command substitution is skipped."""
+    text, bodies = split_heredocs(command)
+    try:
+        toks = shell_tokens(text)
+    except ValueError:
+        return []
+    commands: list[list[str]] = [[]]
+    for t in toks:
+        if t in CMD_SEPARATORS:
+            commands.append([])
+        else:
+            commands[-1].append(t)
+    body_iter = iter(bodies)
+    out: list[tuple[str, Path, str]] = []
+
+    def read_small(p: Path) -> str:
+        try:
+            if p.is_file() and p.stat().st_size <= 300_000:
+                return p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+        return ""
+
+    for cmd in commands:
+        args: list[str] = []
+        redirs: list[str] = []
+        heredoc = ""
+        i = 0
+        while i < len(cmd):
+            t = cmd[i]
+            if t in FILE_REDIRECTS or t in OTHER_REDIRECTS or t in ("<<", "<<-"):
+                if args and len(args[-1]) == 1 and args[-1].isdigit():
+                    args.pop()  # file descriptor of "2>"
+                nxt = cmd[i + 1] if i + 1 < len(cmd) else ""
+                if t in FILE_REDIRECTS and nxt:
+                    redirs.append(nxt)
+                elif t in ("<<", "<<-"):
+                    heredoc = next(body_iter, "")
+                i += 2
+                continue
+            args.append(t)
+            i += 1
+        while args and (args[0] in CMD_WRAPPERS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", args[0])):
+            args.pop(0)
+        name = os.path.basename(args[0]).lower() if args else ""
+        for target in redirs:
+            out.append((target, cwd, heredoc))
+        operands = [a for a in args[1:] if not a.startswith("-")]
+        if name == "cd" and len(operands) == 1 and not re.search(r"[$`*?~]", operands[0]) and operands[0] != "-":
+            cwd = Path(os.path.normpath(cwd / operands[0]))
+        elif name == "touch":
+            out += [(a, cwd, "") for a in operands]
+        elif name == "tee":
+            out += [(a, cwd, heredoc) for a in operands]
+        elif name == "cp" and len(operands) >= 2 and not any(
+                a in ("-t", "--target-directory") or a.startswith("--target-directory") for a in args[1:]):
+            *srcs, dest = operands
+            dest_path = cwd / dest
+            if dest.endswith(("/", "\\")) or dest_path.is_dir():
+                out += [(str(dest_path / os.path.basename(s.rstrip("/\\"))), cwd, read_small(cwd / s))
+                        for s in srcs if not (cwd / s).is_dir()]
+            elif len(srcs) == 1 and not (cwd / srcs[0]).is_dir():
+                out.append((dest, cwd, read_small(cwd / srcs[0])))
+    if re.search(r"\bpython[0-9.]*\b", command):
+        for rx in PY_WRITE_RES:
+            out += [(m.group(2), cwd, "") for m in rx.finditer(command)]
+    return out
+
+
+def handle_pre_bash(data: dict, cfg: dict) -> None:
+    mode = cfg.get("bash_check", "warn")
+    if mode not in ("report", "warn", "block") or (data.get("tool_name") or "Bash") != "Bash":
+        return
+    command = str((data.get("tool_input") or {}).get("command") or "")
+    if not command.strip():
+        return
+    root = project_root(data)
+    cwd = Path(data.get("cwd") or root)
+    sid = data.get("session_id") or "nosession"
+    scratchpad = data.get("scratchpad_dir")
+    ignore = {d.lower() for d in cfg["ignore_dirs"]}
+    seen: set[str] = set()
+    hits: list[tuple[str, dict]] = []
+    for raw, base, content in bash_targets(command, cwd):
+        if not raw or re.search(r"[$`*?{}]", raw) or raw.startswith("/dev/") or raw == "-":
+            continue
+        target = Path(os.path.expanduser(raw))
+        if not target.is_absolute():
+            target = base / target
+        target = Path(os.path.normpath(target))
+        if not is_within(target, root) or norm(target) in seen:
+            continue
+        seen.add(norm(target))
+        if scratchpad and is_within(target, Path(scratchpad).resolve()):
+            continue
+        rel = rel_of(target, root)
+        if any(p.lower() in ignore for p in rel.split("/")[:-1]):
+            continue
+        pattern = protected_match(rel, cfg)
+        if pattern:
+            hits.append((rel, {"mode": "deny", "kind": "protected", "soften": False,
+                               "issue": f"'{rel}' is inside a protected path ('{pattern}').",
+                               "fix": "Do not create, edit or overwrite files there."}))
+            continue
+        if target.exists():
+            continue  # writing to an existing file is an edit
+        for f in judge_new_file(target, rel, cfg, scratchpad, content, root):
+            hits.append((rel, f))
+    if not hits:
+        return
+
+    st = load_state(sid)
+    unattended = truthy_env("SPRAWL_GUARD_UNATTENDED") or bool(st.get("unattended"))
+    prompt = st.get("prompt", "")
+    for rel, f in hits:
+        named, asked = requested(root / rel, prompt, cfg)
+        if f["mode"] == "deny" and f.get("soften", True) and (named or asked):
+            f["mode"] = "confirm"
+
+    if mode == "report":
+        for rel, f in hits:
+            record(cfg, root, sid, "bash", f["kind"], "report", rel)
+        return
+
+    stop: list[tuple[str, dict]] = []
+    note: list[tuple[str, dict]] = []
+    for rel, f in hits:
+        sev = SEVERITY.get(f["mode"], 0)
+        if f["kind"] == "protected" or (
+                mode == "block" and sev >= SEVERITY["confirm"] and not (unattended and f["mode"] == "confirm")):
+            stop.append((rel, f))  # protected paths are blocked in every mode but report
+        else:
+            note.append((rel, f))
+    if stop:
+        asks = [f for _, f in stop if f["mode"] == "confirm"]
+        text = " ".join(f"{f['issue']} {f['fix']}" for _, f in stop)
+        tail = (" Change the command so it follows the workspace rules (edit the original file, use the "
+                "scratchpad or the outputs folder).")
+        if len(asks) == len(stop):  # only confirm-level findings: a retry gets a permission prompt
+            tail += (" Do not decide this yourself: ask the user. If they want these files, run the same "
+                     "command again; they will get a one-time permission prompt.")
+            st.setdefault("pending_bash", [])
+            if command in st["pending_bash"]:
+                for rel, f in stop:
+                    record(cfg, root, sid, "bash", f["kind"], "prompted", rel)
+                st["pending_bash"].remove(command)
+                emit(pre_tool("ask", f"[{TAG}] This shell command creates files: {text}"))
+                save_state(sid, st)
+                return
+            st["pending_bash"].append(command)
+        for rel, f in stop:
+            record(cfg, root, sid, "bash", f["kind"], "blocked" if f["mode"] == "deny" else "confirm", rel)
+            if f["mode"] == "deny":
+                st.setdefault("blocked", {})[rel] = f["kind"]
+        save_state(sid, st)
+        emit(pre_tool("deny", f"[{TAG}] This shell command creates files that break the workspace rules: "
+                              f"{text}{tail}"))
+        return
+    for rel, f in note:
+        record(cfg, root, sid, "bash", f["kind"], "unattended" if unattended and f["mode"] in ("confirm", "ask")
+               else "warned", rel)
+    text = " ".join(f"{f['issue']} {f['fix']}" for _, f in note)
+    emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext":
+          f"[{TAG}] This shell command creates files that break the workspace rules: {text} "
+          "Unless the user asked for these files, change the command (edit the original file, use the "
+          "scratchpad or the outputs folder), or clean up right after it runs."}})
 
 
 # ---------------------------------------------------------------------------
@@ -1255,6 +1580,11 @@ def handle_post_write(data: dict, cfg: dict) -> None:
                 f["line"] += offset
             findings.append(f)
     if findings:
+        counts: dict[str, int] = {}
+        for f in findings:
+            counts[f["kind"]] = counts.get(f["kind"], 0) + 1
+        for kind, n in sorted(counts.items()):
+            record(cfg, root, data.get("session_id") or "", "prose", kind, "warned", rel, n)
         emit({"hookSpecificOutput": {"hookEventName": "PostToolUse",
                                      "additionalContext": prose_message(rel, findings)}})
 
@@ -1569,8 +1899,114 @@ def run_tidy(argv: list[str]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# stats: what sprawl-guard caught in this project
+# ---------------------------------------------------------------------------
+
+STATS_ACTIONS = ["blocked", "confirm", "prompted", "warned", "unattended", "report", "created_after_block"]
+
+
+def load_stats(root: Path, days: int | None) -> list[dict]:
+    p = stats_path(root)
+    cutoff = None
+    if days:
+        cutoff = datetime.fromtimestamp(time.time() - days * 86400).isoformat(timespec="seconds")
+    events: list[dict] = []
+    for path in (p.with_name(p.name + ".1"), p):
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(e, dict) and (cutoff is None or str(e.get("t", "")) >= cutoff):
+                        events.append(e)
+        except OSError:
+            continue
+    return events
+
+
+def summarize_stats(events: list[dict]) -> dict:
+    rules: dict[str, dict[str, int]] = {}
+    prose: dict[str, int] = {}
+    paths: dict[str, int] = {}
+    around: list[str] = []
+    sessions: set[str] = set()
+    by_source: dict[str, int] = {}
+    for e in events:
+        n = int(e.get("n", 1) or 1)
+        sessions.add(str(e.get("session", "")))
+        source, rule, action = str(e.get("source", "")), str(e.get("rule", "")), str(e.get("action", ""))
+        by_source[source] = by_source.get(source, 0) + 1
+        if source == "prose":
+            prose[rule] = prose.get(rule, 0) + n
+            continue
+        if action == "created_after_block":
+            around.append(str(e.get("path", "")))
+        row = rules.setdefault(rule, {})
+        row[action] = row.get(action, 0) + 1
+        if e.get("path") and action != "created_after_block":
+            paths[e["path"]] = paths.get(e["path"], 0) + 1
+    top = sorted(paths.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+    return {"events": len(events), "sessions": len(sessions - {""}), "by_source": by_source,
+            "rules": rules, "prose": prose, "created_after_block": around, "top_paths": top}
+
+
+def format_stats(root: Path, summary: dict, days: int | None) -> str:
+    span = f"last {days} days" if days else "all time"
+    out = [f"sprawl-guard stats for {root} ({span}): {summary['events']} event(s) in "
+           f"{summary['sessions']} session(s)."]
+    if not summary["events"]:
+        out.append("Nothing recorded yet.")
+        return "\n".join(out)
+    if summary["rules"]:
+        cols = [a for a in STATS_ACTIONS if any(a in row for row in summary["rules"].values())]
+        width = max(len(r) for r in summary["rules"]) + 2
+        out += ["", "Rule".ljust(width) + "".join(c.replace("_", " ").rjust(max(len(c), 6) + 2) for c in cols)]
+        for rule in sorted(summary["rules"], key=lambda r: -sum(summary["rules"][r].values())):
+            row = summary["rules"][rule]
+            out.append(rule.ljust(width) + "".join(str(row.get(c, 0)).rjust(max(len(c), 6) + 2) for c in cols))
+        src = summary["by_source"]
+        out.append(f"(from file tools: {src.get('write', 0)}, shell commands: {src.get('bash', 0)})")
+    if summary["created_after_block"]:
+        out += ["", f"Blocked files created anyway: {len(summary['created_after_block'])} "
+                    f"({names(summary['created_after_block'])})"]
+    if summary["prose"]:
+        out += ["", "Prose findings: " + ", ".join(
+            f"{k} {v}" for k, v in sorted(summary["prose"].items(), key=lambda kv: -kv[1]))]
+    if summary["top_paths"]:
+        out += ["", "Most flagged files: " + ", ".join(f"{p} ({n})" for p, n in summary["top_paths"])]
+    return "\n".join(out)
+
+
+def run_stats(argv: list[str]) -> int:
+    """sprawl_guard.py stats [--days N] [--all] [--json]"""
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    days: int | None = 30
+    if "--all" in argv:
+        days = None
+    if "--days" in argv:
+        try:
+            days = int(argv[argv.index("--days") + 1])
+        except (IndexError, ValueError):
+            print("Usage: sprawl_guard.py stats [--days N] [--all] [--json]")
+            return 0
+    root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()).resolve()
+    summary = summarize_stats(load_stats(root, days))
+    if "--json" in argv:
+        print(json.dumps({"root": str(root), "days": days, **summary}, indent=2))
+    else:
+        print(format_stats(root, summary, days))
+    return 0
+
+
 HANDLERS = {
     "pre-write": handle_pre_write,
+    "pre-bash": handle_pre_bash,
     "post-write": handle_post_write,
     "prompt": handle_prompt,
     "session-start": handle_session_start,
@@ -1578,7 +2014,7 @@ HANDLERS = {
     "stop": handle_stop,
 }
 
-COMMANDS = {"tidy": run_tidy, "profile": run_profile, "prose": run_prose}
+COMMANDS = {"tidy": run_tidy, "profile": run_profile, "prose": run_prose, "stats": run_stats}
 
 
 def main() -> int:

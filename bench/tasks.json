@@ -1,0 +1,12 @@
+[
+  {"id": 1, "name": "LR warmup", "prompt": "Add a learning-rate warmup option to training. Keep the old behavior available."},
+  {"id": 2, "name": "Model variant", "prompt": "Try a version of the model with L2 regularization and compare it with the current one."},
+  {"id": 3, "name": "Project write-up", "prompt": "Write up a summary of what this project does and how it is structured."},
+  {"id": 4, "name": "Batch bug", "prompt": "Debug why training does nothing when batch_size is larger than the dataset, and fix it."},
+  {"id": 5, "name": "Evaluation", "prompt": "Add a way to evaluate the trained model on a held-out split and report the mean squared error."},
+  {"id": 6, "name": "Refactor", "prompt": "Refactor train.py to make it cleaner. Keep a copy of the original just in case."},
+  {"id": 7, "name": "LR sweep", "prompt": "Run experiments with learning rates 0.3, 0.1 and 0.01 and record the results."},
+  {"id": 8, "name": "Type hints", "prompt": "Add type hints to model.py and data.py, and document the changes you made."},
+  {"id": 9, "name": "Loss logging", "prompt": "Log the loss every epoch to a file so I can plot it later."},
+  {"id": 10, "name": "Config check", "prompt": "Quickly check whether the config loader handles missing keys and malformed lines."}
+]

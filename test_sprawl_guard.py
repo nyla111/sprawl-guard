@@ -19,6 +19,21 @@ SCRIPT = Path(__file__).resolve().parent / "sprawl_guard.py"
 HOME = tempfile.mkdtemp(prefix="sprawl-guard-home-")  # isolates global config and log
 HAS_GIT = shutil.which("git") is not None
 
+
+def find_bash():
+    """bash as Claude Code uses it. On Windows that is Git Bash, not the WSL bash.exe in System32."""
+    if os.name != "nt":
+        return shutil.which("bash")
+    git = shutil.which("git")
+    candidates = [r"C:\Program Files\Git\bin\bash.exe"]
+    if git:
+        gitroot = Path(git).resolve().parent.parent  # ...\Git\cmd\git.exe -> ...\Git
+        candidates.insert(0, str(gitroot / "bin" / "bash.exe"))
+    return next((c for c in candidates if Path(c).is_file()), None)
+
+
+BASH = find_bash()
+
 CODE = "\n".join(
     ["import argparse", "import torch", "", "def build_model(cfg):", "    layers = []"]
     + [f"    layers.append(torch.nn.Linear({i}, {i + 1}))" for i in range(1, 13)]
@@ -49,7 +64,7 @@ class Base(unittest.TestCase):
     def touch(self, rel, text="x"):
         p = self.root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
+        p.write_text(text, encoding="utf-8")  # Claude Code writes UTF-8 on every platform
         return p
 
     def config(self, **cfg):
@@ -597,7 +612,7 @@ class Prose(Base):
     def test_cli(self):
         self.touch("a.md", self.TEXT)
         res = subprocess.run([sys.executable, str(SCRIPT), "prose", str(self.root / "a.md")],
-                             capture_output=True, env={**os.environ, "SPRAWL_GUARD_HOME": HOME}, timeout=60)
+                             capture_output=True, env={**os.environ, "SPRAWL_GUARD_HOME": HOME, "PYTHONIOENCODING": "utf-8"}, timeout=60)
         self.assertEqual(res.returncode, 1)
         self.assertIn("2 finding(s)", res.stdout.decode())
 
@@ -1001,6 +1016,231 @@ class Tidy(Base):
         self.assertEqual(before, sorted(p.name for p in self.root.rglob("*")))
 
 
+def init_git(root):
+    for args in (["init", "-q"], ["config", "user.email", "t@example.com"], ["config", "user.name", "t"],
+                 ["config", "commit.gpgsign", "false"]):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+
+class BashCheck(Base):
+    def bash(self, command, env=None, cwd=None, **extra):
+        payload = {"session_id": self.session, "cwd": str(cwd or self.root), "hook_event_name": "PreToolUse",
+                   "tool_name": "Bash", "tool_input": {"command": command}}
+        payload.update(extra)
+        return run("pre-bash", payload, env)
+
+    def context(self, out):
+        return out["hookSpecificOutput"].get("additionalContext", "") if out else ""
+
+    def test_redirect_to_versioned_copy_warns(self):
+        self.touch("train.py", "print(1)\n")
+        out = self.bash("sed 's/1/2/' train.py > train_v2.py")
+        self.assertEqual(self.decision(out), "warn")
+        self.assertIn("'train_v2.py' is a versioned copy of existing file 'train.py'", self.context(out))
+
+    def test_block_mode_denies_cp_copy(self):
+        self.config(bash_check="block")
+        self.touch("train.py", "print(1)\n")
+        out = self.bash("cp train.py train_backup.py")
+        self.assertEqual(self.decision(out), "deny")
+        self.assertIn("backup copy", self.reason(out))
+
+    def test_cp_compares_content_of_the_source(self):
+        self.touch("train.py", CODE)
+        self.assertIn("identical to existing 'train.py'", self.context(self.bash("cp train.py run_resnet.py")))
+
+    def test_cp_into_folder(self):
+        self.touch("train.py", "x\n")
+        (self.root / "old").mkdir()
+        self.touch("old/train.py", "y\n")
+        self.touch("debug_x.py", "z\n")
+        self.assertIn("'old/debug_x.py' looks like a one-off", self.context(self.bash("cp debug_x.py old/")))
+
+    def test_heredoc_report_file(self):
+        out = self.bash("cat > SUMMARY.md <<'EOF'\n# Summary\nIt's done; all > fine.\nEOF")
+        self.assertIn("'SUMMARY.md' is a new report", self.context(out))
+
+    def test_heredoc_body_used_as_content(self):
+        self.touch("train.py", CODE)
+        out = self.bash("cat > run_two.py <<EOF\n" + CODE + "\nEOF")
+        self.assertIn("identical to existing 'train.py'", self.context(out))
+
+    def test_overwriting_existing_file_is_an_edit(self):
+        self.touch("README.md", "x\n")
+        self.assertIsNone(self.bash("echo hi > README.md && echo more >> README.md"))
+
+    def test_outputs_devnull_and_fd_redirects_ignored(self):
+        self.assertIsNone(self.bash("python train.py > outputs/run1/log.txt 2>&1"))
+        self.assertIsNone(self.bash("make 2>/dev/null >&2"))
+
+    def test_log_outside_outputs_warns(self):
+        self.assertIn("run output", self.context(self.bash("python train.py 2>&1 | tee train.log")))
+
+    def test_variables_globs_and_quotes_skipped(self):
+        self.assertIsNone(self.bash('echo x > "$OUT/a_v2.py"; touch *.bak'))
+        self.assertIsNone(self.bash('git commit -m "fix > tmp_debug.py"'))
+
+    def test_cd_is_followed(self):
+        (self.root / "src").mkdir()
+        out = self.bash("cd src && touch debug_loader.py")
+        self.assertIn("'src/debug_loader.py' looks like a one-off", self.context(out))
+
+    def test_python_open_for_writing(self):
+        out = self.bash("python3 -c \"open('tmp_check.py', 'w').write('x')\"")
+        self.assertIn("'tmp_check.py' looks like a one-off", self.context(out))
+        self.assertIsNone(self.bash("python3 -c \"print(open('train.py').read())\""))
+
+    def test_protected_path_blocked_even_in_warn_mode(self):
+        self.config(protected_paths=["data/raw/**"])
+        self.touch("data/raw/a.csv", "1\n")
+        out = self.bash("echo 2 >> data/raw/a.csv")
+        self.assertEqual(self.decision(out), "deny")
+        self.assertIn("protected path", self.reason(out))
+
+    def test_off_and_report_modes_say_nothing(self):
+        self.touch("train.py", "x\n")
+        self.config(bash_check="off")
+        self.assertIsNone(self.bash("touch train_v2.py"))
+        self.config(bash_check="report")
+        self.assertIsNone(self.bash("touch train_v2.py"))
+
+    def test_block_mode_confirm_then_permission_prompt(self):
+        self.config(bash_check="block")
+        cmd = "echo notes > weekly_report.md"
+        first = self.bash(cmd)
+        self.assertEqual(self.decision(first), "confirm")
+        self.assertIn("Do not decide this yourself", self.reason(first))
+        self.assertEqual(self.decision(self.bash(cmd)), "ask")
+
+    def test_block_mode_unattended_lets_confirm_through(self):
+        self.config(bash_check="block")
+        out = self.bash("echo notes > weekly_report.md", env={"SPRAWL_GUARD_UNATTENDED": "1"})
+        self.assertEqual(self.decision(out), "warn")
+
+    def test_requested_file_softens_deny_in_block_mode(self):
+        self.config(bash_check="block")
+        self.touch("train.py", "x\n")
+        self.prompt("make a separate copy as train_v2.py please")
+        self.assertIn("Do not decide this yourself", self.reason(self.bash("cp train.py train_v2.py")))
+
+    def test_unparseable_command_fails_open(self):
+        self.assertIsNone(self.bash("echo 'unterminated > tmp_x.py"))
+
+    def test_strict_profile_blocks_and_relaxed_reports(self):
+        self.touch("train.py", "x\n")
+        self.config(profile="strict")
+        self.assertEqual(self.decision(self.bash("touch train_v2.py")), "deny")
+        self.config(profile="relaxed")
+        self.assertIsNone(self.bash("touch train_v2.py"))
+
+
+class NotesFile(Base):
+    def test_report_file_offers_the_notes_file(self):
+        msg = self.reason(self.write("IMPLEMENTATION_SUMMARY.md"))
+        self.assertIn("append it to 'docs/NOTES.md'", msg)
+        self.assertIn("put it in the chat reply", msg)
+
+    def test_existing_index_file_is_preferred(self):
+        self.touch("docs/EXPERIMENTS.md", "# Experiments\n")
+        self.assertIn("append it to 'docs/EXPERIMENTS.md'", self.reason(self.write("results_summary.md")))
+
+    def test_creating_the_notes_file_is_allowed(self):
+        self.assertIsNone(self.write("docs/NOTES.md", "# Notes\n"))
+        self.assertIsNone(self.write("NOTES.md", "# Notes\n"))
+
+    def test_can_be_turned_off(self):
+        self.config(notes_files=[])
+        msg = self.reason(self.write("SUMMARY.md"))
+        self.assertNotIn("append it to", msg)
+        self.assertEqual(self.decision(self.write("NOTES.md")), "confirm")
+
+    def test_session_rules_name_the_notes_file(self):
+        self.touch("NOTES.md", "x\n")
+        out = run("session-start", {"session_id": self.session, "cwd": str(self.root), "source": "startup"})
+        self.assertIn("appended to 'NOTES.md'", out["hookSpecificOutput"]["additionalContext"])
+
+
+class Stats(Base):
+    def stats(self, *args):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("SPRAWL_GUARD", "CLAUDE_PROJECT_DIR"))}
+        env.update(SPRAWL_GUARD_HOME=HOME, CLAUDE_PROJECT_DIR=str(self.root))
+        res = subprocess.run([sys.executable, str(SCRIPT), "stats", *args], capture_output=True, env=env, timeout=60)
+        return res.stdout.decode()
+
+    def test_blocks_and_warnings_are_counted(self):
+        self.touch("train.py", "x\n")
+        self.write("train_v2.py")
+        self.write("design.md")
+        data = json.loads(self.stats("--json"))
+        self.assertEqual(data["rules"]["versioned_files"], {"blocked": 1})
+        self.assertEqual(data["rules"]["other_docs"], {"warned": 1})
+        self.assertEqual(data["by_source"], {"write": 2})
+        text = self.stats()
+        self.assertIn("2 event(s) in 1 session(s)", text)
+        self.assertIn("versioned_files", text)
+
+    def test_prose_findings_counted(self):
+        run("post-write", {"session_id": self.session, "cwd": str(self.root), "tool_name": "Write",
+                           "tool_input": {"file_path": str(self.root / "README.md"),
+                                          "content": "A seamless tool — a seamless life.\n"}})
+        data = json.loads(self.stats("--json"))
+        self.assertEqual(data["prose"], {"stock phrase": 2, "em dash": 1})
+
+    def test_blocked_file_created_anyway(self):
+        self.touch("train.py", "x\n")
+        self.start()
+        self.write("train_v2.py")
+        self.touch("train_v2.py", "x\n")  # e.g. through a shell command
+        self.assertIn("1 blocked file(s) were created anyway", self.stop()["systemMessage"])
+        data = json.loads(self.stats("--json"))
+        self.assertEqual(data["created_after_block"], ["train_v2.py"])
+        self.assertEqual(data["rules"]["versioned_files"]["created_after_block"], 1)
+
+    def test_blocked_then_approved_is_not_counted(self):
+        self.touch("train.py", "x\n")
+        self.start()
+        self.write("train_v2.py")
+        self.prompt("ok, create train_v2.py as a separate file")
+        self.write("train_v2.py")  # confirm
+        self.write("train_v2.py")  # approved retry
+        self.touch("train_v2.py", "x\n")
+        self.assertNotIn("created anyway", self.stop()["systemMessage"])
+
+    def test_can_be_disabled(self):
+        self.config(stats=False)
+        self.touch("train.py", "x\n")
+        self.write("train_v2.py")
+        self.assertIn("Nothing recorded yet", self.stats())
+
+    def test_bash_events_counted(self):
+        self.touch("train.py", "x\n")
+        self.bash_payload = {"session_id": self.session, "cwd": str(self.root), "tool_name": "Bash",
+                             "tool_input": {"command": "touch train_v2.py"}}
+        run("pre-bash", self.bash_payload)
+        data = json.loads(self.stats("--json"))
+        self.assertEqual(data["rules"]["versioned_files"], {"warned": 1})
+        self.assertEqual(data["by_source"], {"bash": 1})
+
+
+@unittest.skipUnless(HAS_GIT, "needs git")
+class GitAwareOrphans(Base):
+    def test_ignored_files_do_not_count_as_references(self):
+        init_git(self.root)
+        self.touch(".gitignore", "scratch_out/\n")
+        self.touch("scratch_out/notes.txt", "uses helper_ops\n")
+        self.start()
+        self.touch("helper_ops.py", "x = 1\n")
+        self.assertIn("1 new file(s) not referenced anywhere", self.stop()["systemMessage"])
+
+    def test_untracked_files_still_count_as_references(self):
+        init_git(self.root)
+        self.start()
+        self.touch("helper_ops.py", "x = 1\n")
+        self.touch("pipeline_main.py", "import helper_ops\n")
+        msg = self.stop()["systemMessage"]
+        self.assertIn("2 created; 1 new file(s) not referenced", msg)
+
+
 class Installer(unittest.TestCase):
     def test_install_and_uninstall_keep_other_settings(self):
         installer = Path(__file__).resolve().parent / "install.py"
@@ -1013,10 +1253,11 @@ class Installer(unittest.TestCase):
                 subprocess.run([sys.executable, str(installer), "--project", proj], check=True, capture_output=True)
             data = json.loads(settings.read_text())
             self.assertEqual(data["model"], "x")
-            self.assertEqual(len(data["hooks"]["PreToolUse"]), 2)
+            self.assertEqual(len(data["hooks"]["PreToolUse"]), 3)
             self.assertEqual(set(data["hooks"]), {"PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart",
                                                   "SubagentStart", "Stop"})
             self.assertEqual(data["hooks"]["PreToolUse"][1]["matcher"], "Write|Edit|MultiEdit|NotebookEdit")
+            self.assertEqual(data["hooks"]["PreToolUse"][2]["matcher"], "Bash")
             subprocess.run([sys.executable, str(installer), "--project", proj, "--uninstall"],
                            check=True, capture_output=True)
             data = json.loads(settings.read_text())
@@ -1070,14 +1311,14 @@ class Plugin(unittest.TestCase):
         self.assertEqual(manifest["version"], sprawl_guard.VERSION)
         self.assertEqual(market["plugins"][0]["name"], manifest["name"])
 
-    @unittest.skipUnless(shutil.which("bash"), "needs bash")
+    @unittest.skipUnless(BASH, "needs bash (Git Bash on Windows)")
     def test_plugin_hook_command_runs(self):
         hooks = json.loads((self.HERE / "hooks" / "hooks.json").read_text())["hooks"]
         command = hooks["SubagentStart"][0]["hooks"][0]["command"]
         command = command.replace("${CLAUDE_PLUGIN_ROOT}", str(self.HERE))
         with tempfile.TemporaryDirectory() as proj:
             env = {**os.environ, "SPRAWL_GUARD_HOME": HOME, "CLAUDE_PROJECT_DIR": proj}
-            res = subprocess.run(["bash", "-c", command], input=b'{"session_id": "p"}',
+            res = subprocess.run([BASH, "-c", command], input=b'{"session_id": "p"}',
                                  capture_output=True, env=env, timeout=60)
         self.assertIn("Workspace rules", json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"])
 

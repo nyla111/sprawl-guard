@@ -1,0 +1,34 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.13"]
+        include:
+          # oldest supported Python; newer Ubuntu images no longer ship 3.9
+          - { os: ubuntu-22.04, python: "3.9" }
+          - { os: windows-latest, python: "3.9" }
+          - { os: macos-latest, python: "3.9" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Git identity for checkpoint tests
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.com
+      - name: Unit tests
+        run: python -m unittest test_sprawl_guard -v
+      - name: Prose check on the docs
+        run: python sprawl_guard.py prose README.md CHANGELOG.md --strict
+      - name: Benchmark script loads
+        run: python bench/run.py --help

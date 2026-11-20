@@ -6,9 +6,9 @@
   python install.py --uninstall [...]    # remove sprawl-guard hooks again
   python install.py --build-plugin       # maintainers: regenerate hooks/hooks.json and skills/
 
-Also installs the /tidy and /sprawl commands as skills (~/.claude/skills/<name>/SKILL.md, or
-PATH/.claude/skills/<name>/SKILL.md with --project). An existing skill of the same name that
-sprawl-guard did not create is left alone.
+Also installs the /tidy, /sprawl and /sprawl-stats commands as skills
+(~/.claude/skills/<name>/SKILL.md, or PATH/.claude/skills/<name>/SKILL.md with --project).
+An existing skill of the same name that sprawl-guard did not create is left alone.
 
 Installing as a Claude Code plugin instead (/plugin install) needs none of this; do not use both.
 
@@ -32,6 +32,7 @@ MARKER = "sprawl_guard.py"
 # (event, matcher or None, script argument, timeout seconds)
 HOOKS = [
     ("PreToolUse", "Write|Edit|MultiEdit|NotebookEdit", "pre-write", 20),
+    ("PreToolUse", "Bash", "pre-bash", 10),
     ("PostToolUse", "Write|Edit|MultiEdit", "post-write", 10),
     ("UserPromptSubmit", None, "prompt", 10),
     ("SessionStart", None, "session-start", 15),
@@ -132,6 +133,15 @@ Profiles: relaxed (most rules only warn), default, strict (tighter rules, file n
 turn summary, strict prose check), off (sprawl-guard does nothing in this project).
 """
 
+STATS_BODY = """# /stats
+
+!`{invoke}`
+
+Tell the user in a few lines what stands out above: which rules fire most, any blocked files that
+were created anyway, and any rule that looks like a false positive (many warnings on files they
+clearly wanted). Suggest a config change only if the numbers support it. Do not edit config files.
+"""
+
 SKILLS = {
     "tidy": {
         "description": "Find existing file sprawl in this project (_v2/_final copies, backups, near-copies, "
@@ -142,6 +152,11 @@ SKILLS = {
         "description": "Show or set the sprawl-guard profile for this project (relaxed, default, strict, off); "
                        "add --global for all projects.",
         "hint": "[relaxed|default|strict|off] [--global]", "cli": "profile", "body": SPRAWL_BODY,
+    },
+    "sprawl-stats": {
+        "description": "Show what sprawl-guard caught in this project: warnings and blocks per rule, "
+                       "blocked files created anyway, prose findings.",
+        "hint": "[--days N] [--all]", "cli": "stats", "body": STATS_BODY,
     },
 }
 

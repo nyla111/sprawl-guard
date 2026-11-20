@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.6.0 - unreleased
+
+**Manual installs: re-run the installer after updating** (`python3 install.py`, plus
+`--project PATH` if you installed per project) to get the shell-command hook and the
+`/sprawl-stats` command, then restart Claude Code.
+
+Added:
+- Shell check (`bash_check`, default `warn`): files created by shell commands (`>`, `>>`, `tee`,
+  `touch`, `cp`, `python -c "open(..., 'w')"`, here-docs) go through the same rules as files
+  written with Claude's file tools. `block` blocks them; `report` only records them. Writes into
+  protected paths are blocked in both `warn` and `block`. `strict` sets `block`, `relaxed` sets
+  `report`.
+- Notes file (`notes_files`): report and summary files are steered to the chat reply or to one
+  notes file (`docs/NOTES.md` by default, or an existing `NOTES.md` or `EXPERIMENTS.md`).
+  Creating that file is always allowed, and the session rules name it.
+- Stats (`stats`, default on): every warning and block is recorded per project in
+  `~/.claude/sprawl-guard-stats/`. `/sprawl-stats` or `python3 sprawl_guard.py stats` shows
+  counts per rule, blocked files that were created anyway, and prose findings.
+- The turn summary says when a blocked file was created anyway in the same turn.
+- Benchmark script (`bench/run.py`): runs 10 tasks with and without sprawl-guard and counts
+  the sprawl.
+- GitHub Actions: tests on Linux, Windows and macOS with Python 3.9 and 3.13.
+
+Changed:
+- The orphan check reads the same file list as the turn summary, so in a git repo files
+  ignored by `.gitignore` no longer count as references.
+- Hook events: seven (`pre-bash` is new).
+- Requires Python 3.9+ (tested in CI).
+
 ## v0.5.0 - 2026-11-08
 
 **Manual installs: re-run the installer after updating** (`python3 install.py`, plus
